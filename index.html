@@ -1,0 +1,695 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Polymex — Cockpit usine</title>
+<script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4.1.4/dist/index.global.js"></script>
+<script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js" crossorigin></script>
+<style>
+  :root { --navy:#172B4D; --navy-2:#2D4A7A; --navy-3:#8FA3C4; --accent:#E8710A; --ok:#1F7A4D; --ink:#1E2530; --muted:#5E6C84; --line:#DFE3EA; --bg:#F4F5F7; }
+  body { background:var(--bg); color:var(--ink); font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  .num { font-variant-numeric: tabular-nums; }
+  .card { background:#fff; border:1px solid var(--line); border-radius:8px; }
+  svg text { font-family: inherit; }
+</style>
+</head>
+<body>
+<div id="root">
+  <div style="padding:48px;text-align:center;color:#5E6C84">Chargement du cockpit…</div>
+</div>
+
+<!--
+  Bibliothèque KPI : JavaScript pur (pas de JSX) pour pouvoir être testée par node
+  (voir tests/kpi.test.js, qui extrait ce bloc). Toutes les agrégations se font par
+  sommes, jamais par moyenne de ratios.
+-->
+<script id="kpi-lib">
+(function (root) {
+  var STAGES = ["mixing", "extrusion", "packing"];
+  // Au-delà de ce tonnage, une ligne de 2,3 t/h sur 8 h (≈ 18 t max) a forcément été saisie en kg.
+  var KG_THRESHOLD_T = 100;
+
+  function safeDiv(a, b) { return b > 0 ? a / b : null; }
+
+  function parseCSV(text) {
+    var lines = text.replace(/\r/g, "").split("\n").filter(function (l) { return l.trim() !== ""; });
+    if (!lines.length) return [];
+    var head = lines[0].split(",").map(function (h) { return h.trim(); });
+    return lines.slice(1).map(function (l) {
+      var cells = l.split(","), row = {};
+      head.forEach(function (h, i) {
+        var v = (cells[i] || "").trim();
+        row[h] = v !== "" && !isNaN(Number(v)) && h !== "date" ? Number(v) : v;
+      });
+      return row;
+    });
+  }
+
+  // Nettoyage du journal d'extrusion. Renvoie les lignes propres et la liste des corrections appliquées.
+  function cleanShiftLog(rows) {
+    var seen = {}, out = [], dups = [], kg = [], zero = [], overStop = [];
+    rows.forEach(function (r) {
+      var key = JSON.stringify(r);
+      if (seen[key]) { dups.push(r); return; }
+      seen[key] = true;
+      var c = Object.assign({}, r);
+      if (c.output_t > KG_THRESHOLD_T) {
+        kg.push({ date: c.date, shift: c.shift, machine: c.machine, raw: c.output_t });
+        c.output_t = c.output_t / 1000; c.scrap_t = c.scrap_t / 1000;
+      }
+      if (c.planned_min === 0) zero.push(c);
+      var stops = c.changeover_min + c.unplanned_downtime_min + c.other_stop_min;
+      if (stops > c.planned_min) overStop.push({ date: c.date, shift: c.shift, machine: c.machine, stops: stops, planned: c.planned_min });
+      out.push(c);
+    });
+    return { rows: out, duplicates: dups, kgRows: kg, zeroPlanned: zero, overStop: overStop };
+  }
+
+  // Combinaisons date × shift absentes du journal.
+  function missingShifts(rows) {
+    var have = {}, dates = {};
+    rows.forEach(function (r) { have[r.date + "|" + r.shift] = true; dates[r.date] = true; });
+    var out = [];
+    Object.keys(dates).sort().forEach(function (d) {
+      ["A", "B", "C"].forEach(function (s) { if (!have[d + "|" + s]) out.push({ date: d, shift: s }); });
+    });
+    return out;
+  }
+
+  // TRS = disponibilité × performance × qualité, chaque terme agrégé par sommes.
+  function oee(rows) {
+    var t = { planned: 0, run: 0, output: 0, scrap: 0, ideal: 0, down: 0, other: 0, co: 0, coMin: 0, n: rows.length };
+    rows.forEach(function (r) {
+      t.planned += r.planned_min; t.run += r.run_min; t.output += r.output_t; t.scrap += r.scrap_t;
+      t.ideal += r.run_min / 60 * r.ideal_rate_tph;
+      t.down += r.unplanned_downtime_min; t.other += r.other_stop_min;
+      t.co += r.changeovers; t.coMin += r.changeover_min;
+    });
+    var a = safeDiv(t.run, t.planned), p = safeDiv(t.output, t.ideal);
+    var q = t.output > 0 ? 1 - t.scrap / t.output : null;
+    return Object.assign(t, {
+      availability: a, performance: p, quality: q,
+      oee: a === null || p === null || q === null ? null : a * p * q,
+      good: t.output - t.scrap, scrapRate: safeDiv(t.scrap, t.output),
+      coShare: safeDiv(t.coMin, t.planned)
+    });
+  }
+
+  function groupBy(rows, fn) {
+    var m = {};
+    rows.forEach(function (r) { var k = fn(r); (m[k] = m[k] || []).push(r); });
+    return m;
+  }
+
+  // Lundi de la semaine (ISO) d'une date AAAA-MM-JJ.
+  function weekStart(iso) {
+    var d = new Date(iso + "T00:00:00Z"), day = (d.getUTCDay() + 6) % 7;
+    d.setUTCDate(d.getUTCDate() - day);
+    return d.toISOString().slice(0, 10);
+  }
+
+  // Taux starved / blocked par étape (en part des planned_min de l'étape) et identification du goulot.
+  function flow(stageRows) {
+    var by = groupBy(stageRows, function (r) { return r.stage; });
+    var stages = STAGES.map(function (s) {
+      var rows = by[s] || [], P = 0, st = 0, bl = 0, out = 0;
+      rows.forEach(function (r) { P += r.planned_min; st += r.starved_min; bl += r.blocked_min; out += r.output_t; });
+      return { stage: s, planned: P, starved: st, blocked: bl, output: out,
+        starvedPct: safeDiv(st, P), blockedPct: safeDiv(bl, P), idlePct: safeDiv(st + bl, P) };
+    });
+    // Le goulot est l'étape qui attend le moins (ni affamée ni bloquée) : l'amont s'y bloque, l'aval y est affamé.
+    var bottleneck = stages.reduce(function (best, s) {
+      return s.idlePct !== null && (best === null || s.idlePct < best.idlePct) ? s : best;
+    }, null);
+    return { stages: stages, bottleneck: bottleneck ? bottleneck.stage : null };
+  }
+
+  root.PolymexKPI = { safeDiv: safeDiv, parseCSV: parseCSV, cleanShiftLog: cleanShiftLog, missingShifts: missingShifts,
+    oee: oee, groupBy: groupBy, weekStart: weekStart, flow: flow, STAGES: STAGES };
+})(typeof window !== "undefined" ? window : globalThis);
+</script>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useMemo } = React;
+const K = window.PolymexKPI;
+
+const C = { navy: "#172B4D", navy2: "#2D4A7A", navy3: "#8FA3C4", accent: "#E8710A", ok: "#1F7A4D", muted: "#5E6C84", grid: "#E6E9EF" };
+const STAGE_FR = { mixing: "Mélange", extrusion: "Extrusion", packing: "Conditionnement" };
+const MONTHS = ["janv.", "févr.", "mars", "avr.", "mai", "juin", "juil.", "août", "sept.", "oct.", "nov.", "déc."];
+
+const nf1 = new Intl.NumberFormat("fr-FR", { minimumFractionDigits: 1, maximumFractionDigits: 1 });
+const nf0 = new Intl.NumberFormat("fr-FR", { maximumFractionDigits: 0 });
+const pct = (v) => (v === null || v === undefined ? "—" : nf1.format(v * 100) + " %");
+const tons = (v) => (v === null || v === undefined ? "—" : nf1.format(v) + " t");
+const mins = (v) => (v === null || v === undefined ? "—" : nf0.format(v) + " min");
+const hours = (m) => nf0.format(m / 60) + " h";
+const dShort = (iso) => { const [, m, d] = iso.split("-"); return `${Number(d)} ${MONTHS[Number(m) - 1]}`; };
+const dLong = (iso) => { const [y, m, d] = iso.split("-"); return `${Number(d)} ${MONTHS[Number(m) - 1]} ${y}`; };
+
+// ---------- Calculs ----------
+function buildModel(shiftRaw, stageRaw) {
+  const clean = K.cleanShiftLog(shiftRaw);
+  const rows = clean.rows;
+  const dates = [...new Set(rows.map((r) => r.date))].sort();
+  const plant = K.oee(rows);
+
+  const machines = Object.entries(K.groupBy(rows, (r) => r.machine))
+    .map(([m, rs]) => ({ machine: m, ...K.oee(rs), rows: rs }))
+    .sort((a, b) => a.machine.localeCompare(b.machine));
+
+  const shifts = ["A", "B", "C"].map((s) => ({ shift: s, ...K.oee(rows.filter((r) => r.shift === s)) }));
+
+  const weekly = (rs) => Object.entries(K.groupBy(rs, (r) => K.weekStart(r.date)))
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([w, wr]) => ({ week: w, days: new Set(wr.map((r) => r.date)).size, ...K.oee(wr) }));
+
+  const stageClean = stageRaw;
+  const flow = K.flow(stageClean);
+  const stageWeekly = Object.entries(K.groupBy(stageClean, (r) => K.weekStart(r.date)))
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([w, wr]) => {
+      const f = K.flow(wr);
+      const o = { week: w };
+      f.stages.forEach((s) => { o[s.stage] = s; });
+      return o;
+    });
+
+  return {
+    clean, rows, dates, plant, machines, shifts,
+    weeks: weekly(rows), weeklyOf: (m) => weekly(rows.filter((r) => r.machine === m)),
+    missing: K.missingShifts(rows), flow, stageWeekly,
+    stageOutput: Object.fromEntries(flow.stages.map((s) => [s.stage, s.output])),
+  };
+}
+
+// ---------- Graphiques SVG ----------
+function useHover() { const [h, setH] = useState(null); return [h, setH]; }
+
+// Maximum d'axe « rond » (4 graduations de pas 1, 2, 2,5 ou 5 × 10^n).
+function niceMax(v) {
+  if (!(v > 0)) return 1;
+  const raw = v / 4, mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  const step = [1, 2, 2.5, 5, 10].map((k) => k * mag).find((k) => k >= raw);
+  return step * 4;
+}
+
+// Barres verticales sur une catégorie temporelle.
+function Bars({ data, value, label, fmt, height = 200, width = 720, color = C.navy, highlight, yMax, refLine }) {
+  const [h, setH] = useHover();
+  const W = width, H = height, pl = 52, pr = 12, pt = 16, pb = 30;
+  const max = yMax || niceMax(Math.max(...data.map(value).filter((v) => v !== null), 0));
+  const bw = (W - pl - pr) / data.length;
+  const y = (v) => pt + (H - pt - pb) * (1 - v / max);
+  const ticks = [0, 0.25, 0.5, 0.75, 1].map((t) => t * max);
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-auto" role="img">
+      {ticks.map((t, i) => (
+        <g key={i}>
+          <line x1={pl} x2={W - pr} y1={y(t)} y2={y(t)} stroke={C.grid} />
+          <text x={pl - 6} y={y(t) + 4} textAnchor="end" fontSize="11" fill={C.muted}>{fmt.axis(t)}</text>
+        </g>
+      ))}
+      {refLine !== undefined && (
+        <g>
+          <line x1={pl} x2={W - pr} y1={y(refLine.v)} y2={y(refLine.v)} stroke={C.muted} strokeDasharray="4 3" />
+          <text x={W - pr} y={y(refLine.v) - 4} textAnchor="end" fontSize="11" fill={C.muted}>{refLine.label}</text>
+        </g>
+      )}
+      {data.map((d, i) => {
+        const v = value(d);
+        if (v === null) return null;
+        const x = pl + i * bw + bw * 0.15, top = y(v);
+        const fill = highlight && highlight(d) ? C.accent : color;
+        return (
+          <g key={i} onMouseEnter={() => setH(i)} onMouseLeave={() => setH(null)}>
+            <rect x={pl + i * bw} y={pt} width={bw} height={H - pt - pb} fill="transparent" />
+            <rect x={x} y={top} width={bw * 0.7} height={Math.max(0, y(0) - top)} rx="2" fill={fill} opacity={h === null || h === i ? 1 : 0.55} />
+            {(i % Math.ceil(data.length / 13) === 0) && (
+              <text x={x + bw * 0.35} y={H - 10} textAnchor="middle" fontSize="11" fill={C.muted}>{label(d)}</text>
+            )}
+          </g>
+        );
+      })}
+      {h !== null && value(data[h]) !== null && (() => {
+        const x = Math.min(Math.max(pl + h * bw + bw / 2, pl + 70), W - pr - 70), top = y(value(data[h]));
+        return (
+          <g pointerEvents="none">
+            <rect x={x - 70} y={Math.max(0, top - 30)} width="140" height="22" rx="4" fill={C.navy} />
+            <text x={x} y={Math.max(0, top - 30) + 15} textAnchor="middle" fontSize="12" fill="#fff">{label(data[h])} · {fmt.tip(value(data[h]))}</text>
+          </g>
+        );
+      })()}
+    </svg>
+  );
+}
+
+// Courbes multiples sur une catégorie temporelle.
+function Lines({ data, series, label, fmt, height = 220, width = 720, yMax, yMin = 0 }) {
+  const [h, setH] = useHover();
+  const W = width, H = height, pl = 52, pr = 12, pt = 16, pb = 30;
+  const all = data.flatMap((d) => series.map((s) => s.value(d))).filter((v) => v !== null);
+  const max = yMax || niceMax(Math.max(...all));
+  const step = (W - pl - pr) / Math.max(1, data.length - 1);
+  const xs = (i) => pl + i * step;
+  const y = (v) => pt + (H - pt - pb) * (1 - (v - yMin) / (max - yMin));
+  const ticks = [0, 0.25, 0.5, 0.75, 1].map((t) => yMin + t * (max - yMin));
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-auto" role="img"
+      onMouseLeave={() => setH(null)}
+      onMouseMove={(e) => {
+        const r = e.currentTarget.getBoundingClientRect();
+        const px = ((e.clientX - r.left) / r.width) * W;
+        setH(Math.min(data.length - 1, Math.max(0, Math.round((px - pl) / step))));
+      }}>
+      {ticks.map((t, i) => (
+        <g key={i}>
+          <line x1={pl} x2={W - pr} y1={y(t)} y2={y(t)} stroke={C.grid} />
+          <text x={pl - 6} y={y(t) + 4} textAnchor="end" fontSize="11" fill={C.muted}>{fmt.axis(t)}</text>
+        </g>
+      ))}
+      {data.map((d, i) => (i % Math.ceil(data.length / 13) === 0) && (
+        <text key={i} x={xs(i)} y={H - 10} textAnchor="middle" fontSize="11" fill={C.muted}>{label(d)}</text>
+      ))}
+      {series.map((s) => {
+        const pts = data.map((d, i) => [xs(i), s.value(d)]).filter(([, v]) => v !== null);
+        return (
+          <g key={s.name}>
+            <polyline fill="none" stroke={s.color} strokeWidth="2.5" strokeLinejoin="round" points={pts.map(([x, v]) => `${x},${y(v)}`).join(" ")} />
+            {pts.map(([x, v], i) => <circle key={i} cx={x} cy={y(v)} r="3" fill={s.color} />)}
+          </g>
+        );
+      })}
+      {h !== null && (() => {
+        const x = xs(h), bx = Math.min(Math.max(x + 8, pl), W - pr - 190);
+        return (
+          <g pointerEvents="none">
+            <line x1={x} x2={x} y1={pt} y2={H - pb} stroke={C.muted} strokeDasharray="3 3" />
+            <rect x={bx} y={pt} width="190" height={22 + series.length * 18} rx="4" fill={C.navy} />
+            <text x={bx + 10} y={pt + 16} fontSize="12" fill="#fff" fontWeight="600">{label(data[h])}</text>
+            {series.map((s, i) => (
+              <text key={s.name} x={bx + 10} y={pt + 34 + i * 18} fontSize="12" fill="#fff">
+                <tspan fill={s.color === C.navy ? "#9FB3D9" : s.color}>■ </tspan>{s.name} : {fmt.tip(s.value(data[h]))}
+              </text>
+            ))}
+          </g>
+        );
+      })()}
+    </svg>
+  );
+}
+
+// Barre horizontale simple (classement, part d'un tout).
+function HBar({ v, max = 1, color = C.navy, h = 10 }) {
+  const w = v === null ? 0 : Math.max(0, Math.min(1, v / max)) * 100;
+  return (
+    <div className="w-full rounded-sm" style={{ background: C.grid, height: h }}>
+      <div className="rounded-sm" style={{ width: `${w}%`, background: color, height: h }} />
+    </div>
+  );
+}
+
+function Legend({ items }) {
+  return (
+    <div className="flex flex-wrap gap-4 text-sm" style={{ color: C.muted }}>
+      {items.map((i) => (
+        <span key={i.name} className="flex items-center gap-1.5">
+          <span style={{ width: 12, height: 3, background: i.color, display: "inline-block" }} />{i.name}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+// ---------- Mise en page ----------
+function Card({ title, sub, children, className = "" }) {
+  return (
+    <section className={`card p-5 ${className}`}>
+      {title && <h2 className="text-lg font-semibold" style={{ color: C.navy }}>{title}</h2>}
+      {sub && <p className="text-sm mt-0.5 mb-3" style={{ color: C.muted }}>{sub}</p>}
+      {!sub && title && <div className="mb-3" />}
+      {children}
+    </section>
+  );
+}
+
+function Kpi({ label, value, note, alert }) {
+  return (
+    <div className="card p-5" style={alert ? { borderTop: `4px solid ${C.accent}` } : { borderTop: `4px solid ${C.navy}` }}>
+      <div className="text-sm font-medium uppercase tracking-wide" style={{ color: C.muted }}>{label}</div>
+      <div className="num text-4xl font-semibold mt-2" style={{ color: C.navy }}>{value}</div>
+      {note && <div className="text-sm mt-1" style={{ color: C.muted }}>{note}</div>}
+    </div>
+  );
+}
+
+const fmtPct = { axis: (v) => nf0.format(v * 100) + " %", tip: pct };
+const fmtT = { axis: (v) => nf0.format(v) + " t", tip: tons };
+const fmtN = { axis: (v) => nf0.format(v), tip: (v) => nf0.format(v) };
+
+// ---------- Onglet 1 : vue d'ensemble ----------
+function Overview({ M }) {
+  const ranked = [...M.machines].sort((a, b) => b.oee - a.oee);
+  const worst = ranked[ranked.length - 1];
+  const maxOee = Math.max(...ranked.map((m) => m.oee));
+  return (
+    <div className="space-y-5">
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+        <Kpi label="TRS extrusion" value={pct(M.plant.oee)}
+          note={`Dispo ${pct(M.plant.availability)} · Perf ${pct(M.plant.performance)} · Qualité ${pct(M.plant.quality)}`} />
+        <Kpi label="Production brute" value={tons(M.plant.output)} note={`dont ${tons(M.plant.good)} bonnes · ${nf1.format(M.plant.output / M.dates.length)} t/jour`} />
+        <Kpi label="Taux de rebut" value={pct(M.plant.scrapRate)} note={`${tons(M.plant.scrap)} rebutées ou retravaillées`} />
+        <Kpi label="Arrêts non planifiés" value={mins(M.plant.down)} alert
+          note={`${hours(M.plant.down)} de pannes · ${pct(K.safeDiv(M.plant.down, M.plant.planned))} du temps planifié`} />
+      </div>
+
+      <div className="grid grid-cols-1 xl:grid-cols-5 gap-5">
+        <Card className="xl:col-span-3" title="Tendance hebdomadaire" sub={`Production brute (t) et TRS par semaine, du lundi au dimanche. Semaines partielles : ${M.weeks.filter((w) => w.days < 7).map((w) => `${dShort(w.week)} (${w.days} j)`).join(", ")}.`}>
+          <div className="text-sm font-medium mb-1" style={{ color: C.navy }}>Production brute par semaine</div>
+          <Bars data={M.weeks} value={(d) => d.output} label={(d) => dShort(d.week)} fmt={fmtT} height={180}
+            highlight={(d) => d.days < 7} />
+          <div className="text-sm font-medium mt-4 mb-1" style={{ color: C.navy }}>TRS par semaine</div>
+          <Lines data={M.weeks} series={[{ name: "TRS", value: (d) => d.oee, color: C.navy }]} label={(d) => dShort(d.week)}
+            fmt={fmtPct} height={180} yMin={0.4} yMax={0.8} />
+          <p className="text-xs mt-2" style={{ color: C.muted }}>Barres orange : semaines incomplètes, à ne pas comparer en volume.</p>
+        </Card>
+
+        <Card className="xl:col-span-2" title="Classement des lignes par TRS" sub="Période complète, janvier à mars 2026">
+          <div className="space-y-3">
+            {ranked.map((m, i) => (
+              <div key={m.machine}>
+                <div className="flex justify-between items-baseline">
+                  <span className="font-semibold" style={{ color: C.navy }}>{i + 1}. {m.machine}</span>
+                  <span className="num font-semibold text-lg" style={{ color: m === worst ? C.accent : C.navy }}>{pct(m.oee)}</span>
+                </div>
+                <HBar v={m.oee} max={maxOee} color={m === worst ? C.accent : C.navy} h={12} />
+                <div className="num text-xs mt-0.5" style={{ color: C.muted }}>
+                  Dispo {pct(m.availability)} · Perf {pct(m.performance)} · Qualité {pct(m.quality)}
+                </div>
+              </div>
+            ))}
+          </div>
+        </Card>
+      </div>
+      <DataNotes M={M} />
+    </div>
+  );
+}
+
+// ---------- Onglet 2 : lignes ----------
+function Lines_({ M }) {
+  const [sel, setSel] = useState("M07");
+  const m = M.machines.find((x) => x.machine === sel);
+  const wk = useMemo(() => M.weeklyOf(sel), [sel, M]);
+  const coWeeks = M.weeks;
+  const best = (k) => Math.max(...M.machines.map((x) => x[k]));
+  const worst = (k) => Math.min(...M.machines.map((x) => x[k]));
+  const cell = (x, k) => {
+    const isWorst = x[k] === worst(k);
+    return <td className="num py-2 px-3 text-right" style={{ color: isWorst ? C.accent : C.ink, fontWeight: isWorst ? 600 : 400 }}>{pct(x[k])}</td>;
+  };
+  const losses = [
+    { name: "Changements de série", v: m.coMin, color: C.accent },
+    { name: "Pannes (non planifié)", v: m.down, color: C.navy },
+    { name: "Autres arrêts", v: m.other, color: C.navy3 },
+  ];
+  return (
+    <div className="space-y-5">
+      <Card title="Comparaison des lignes M01 à M07" sub="Cliquer sur une ligne pour afficher son détail. En orange : la plus faible valeur de chaque colonne.">
+        <div className="overflow-x-auto">
+          <table className="w-full text-base">
+            <thead>
+              <tr className="text-sm text-left" style={{ color: C.muted, borderBottom: `1px solid ${C.grid}` }}>
+                <th className="py-2 px-3">Ligne</th><th className="py-2 px-3 text-right">TRS</th>
+                <th className="py-2 px-3 text-right">Disponibilité</th><th className="py-2 px-3 text-right">Performance</th>
+                <th className="py-2 px-3 text-right">Qualité</th><th className="py-2 px-3 text-right">Production brute</th>
+                <th className="py-2 px-3 text-right">Changements</th><th className="py-2 px-3 text-right">Min. perdues</th>
+                <th className="py-2 px-3 text-right">Part du planifié</th>
+              </tr>
+            </thead>
+            <tbody>
+              {M.machines.map((x) => (
+                <tr key={x.machine} onClick={() => setSel(x.machine)} className="cursor-pointer"
+                  style={{ background: x.machine === sel ? "#E9EEF6" : undefined, borderBottom: `1px solid ${C.grid}` }}>
+                  <td className="py-2 px-3 font-semibold" style={{ color: C.navy }}>{x.machine}</td>
+                  {cell(x, "oee")}{cell(x, "availability")}{cell(x, "performance")}{cell(x, "quality")}
+                  <td className="num py-2 px-3 text-right">{tons(x.output)}</td>
+                  <td className="num py-2 px-3 text-right">{nf0.format(x.co)}</td>
+                  <td className="num py-2 px-3 text-right">{mins(x.coMin)}</td>
+                  <td className="num py-2 px-3 text-right" style={{ color: x.coShare === best("coShare") ? C.accent : C.ink }}>{pct(x.coShare)}</td>
+                </tr>
+              ))}
+              <tr className="font-semibold" style={{ color: C.navy }}>
+                <td className="py-2 px-3">Usine</td>
+                <td className="num py-2 px-3 text-right">{pct(M.plant.oee)}</td>
+                <td className="num py-2 px-3 text-right">{pct(M.plant.availability)}</td>
+                <td className="num py-2 px-3 text-right">{pct(M.plant.performance)}</td>
+                <td className="num py-2 px-3 text-right">{pct(M.plant.quality)}</td>
+                <td className="num py-2 px-3 text-right">{tons(M.plant.output)}</td>
+                <td className="num py-2 px-3 text-right">{nf0.format(M.plant.co)}</td>
+                <td className="num py-2 px-3 text-right">{mins(M.plant.coMin)}</td>
+                <td className="num py-2 px-3 text-right">{pct(M.plant.coShare)}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </Card>
+
+      <div className="grid grid-cols-1 xl:grid-cols-5 gap-5">
+        <Card className="xl:col-span-3" title={`Détail ${sel}`} sub="TRS hebdomadaire de la ligne comparé au TRS usine">
+          <div className="flex flex-wrap gap-2 mb-3">
+            {M.machines.map((x) => (
+              <button key={x.machine} onClick={() => setSel(x.machine)}
+                className="px-3 py-1 rounded text-sm font-semibold border"
+                style={x.machine === sel ? { background: C.navy, color: "#fff", borderColor: C.navy } : { color: C.navy, borderColor: C.grid, background: "#fff" }}>
+                {x.machine}
+              </button>
+            ))}
+          </div>
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4">
+            {[["TRS", m.oee], ["Disponibilité", m.availability], ["Performance", m.performance], ["Qualité", m.quality]].map(([l, v]) => (
+              <div key={l} className="rounded p-3" style={{ background: "#F4F5F7" }}>
+                <div className="text-xs uppercase tracking-wide" style={{ color: C.muted }}>{l}</div>
+                <div className="num text-2xl font-semibold" style={{ color: C.navy }}>{pct(v)}</div>
+              </div>
+            ))}
+          </div>
+          <Legend items={[{ name: sel, color: C.accent }, { name: "Usine", color: C.navy3 }]} />
+          <Lines data={wk.map((w, i) => ({ ...w, plant: M.weeks[i] }))}
+            series={[{ name: sel, value: (d) => d.oee, color: C.accent }, { name: "Usine", value: (d) => d.plant.oee, color: C.navy3 }]}
+            label={(d) => dShort(d.week)} fmt={fmtPct} height={200} yMin={0.3} yMax={0.7} />
+        </Card>
+
+        <Card className="xl:col-span-2" title={`Où partent les minutes de ${sel}`} sub={`Sur ${mins(m.planned)} planifiées, ${mins(m.run)} de marche`}>
+          <div className="space-y-4">
+            {losses.map((l) => (
+              <div key={l.name}>
+                <div className="flex justify-between text-sm"><span>{l.name}</span>
+                  <span className="num font-semibold">{mins(l.v)} · {pct(K.safeDiv(l.v, m.planned))}</span></div>
+                <HBar v={K.safeDiv(l.v, m.planned)} max={0.2} color={l.color} />
+              </div>
+            ))}
+            <div className="text-sm pt-2" style={{ color: C.muted, borderTop: `1px solid ${C.grid}` }}>
+              {nf0.format(m.co)} changements de série, soit {mins(K.safeDiv(m.coMin, m.co))} en moyenne chacun.
+              Production : {tons(m.output)}, dont {tons(m.good)} bonnes.
+            </div>
+          </div>
+        </Card>
+      </div>
+
+      <div className="grid grid-cols-1 xl:grid-cols-5 gap-5">
+        <Card className="xl:col-span-2" title="Comparaison des équipes" sub="A 06h–14h · B 14h–22h · C 22h–06h">
+          <table className="w-full">
+            <thead><tr className="text-sm" style={{ color: C.muted, borderBottom: `1px solid ${C.grid}` }}>
+              <th className="py-2 text-left">Équipe</th><th className="text-right">TRS</th><th className="text-right">Dispo</th>
+              <th className="text-right">Perf</th><th className="text-right">Qualité</th><th className="text-right">Production</th></tr></thead>
+            <tbody>
+              {M.shifts.map((s) => {
+                const low = s.oee === Math.min(...M.shifts.map((x) => x.oee));
+                return (
+                  <tr key={s.shift} style={{ borderBottom: `1px solid ${C.grid}` }}>
+                    <td className="py-2 font-semibold" style={{ color: C.navy }}>{s.shift}</td>
+                    <td className="num text-right font-semibold" style={{ color: low ? C.accent : C.navy }}>{pct(s.oee)}</td>
+                    <td className="num text-right">{pct(s.availability)}</td>
+                    <td className="num text-right" style={{ color: s.performance === Math.min(...M.shifts.map((x) => x.performance)) ? C.accent : C.ink }}>{pct(s.performance)}</td>
+                    <td className="num text-right">{pct(s.quality)}</td>
+                    <td className="num text-right">{tons(s.output)}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+          <p className="text-sm mt-3" style={{ color: C.muted }}>
+            {(() => {
+              const low = M.shifts.reduce((a, b) => (b.performance < a.performance ? b : a));
+              return `L'équipe ${low.shift} a la performance la plus faible (${pct(low.performance)}).`;
+            })()}
+            {M.missing.length > 0 && ` Équipes absentes du journal : ${M.missing.map((x) => `${x.shift} le ${dLong(x.date)}`).join(", ")}.`}
+          </p>
+        </Card>
+        <Card className="xl:col-span-3" title="Changements de série par semaine" sub="Toutes lignes confondues. Semaines partielles en orange.">
+          <Bars data={coWeeks} value={(d) => d.co} label={(d) => dShort(d.week)} fmt={fmtN} height={200} highlight={(d) => d.days < 7} />
+          <p className="text-sm mt-2" style={{ color: C.muted }}>
+            {nf0.format(M.plant.co)} changements sur la période, {mins(M.plant.coMin)} perdues, soit {pct(M.plant.coShare)} du temps planifié.
+          </p>
+        </Card>
+      </div>
+    </div>
+  );
+}
+
+// ---------- Onglet 3 : flow ----------
+function Flow({ M }) {
+  const { stages, bottleneck } = M.flow;
+  const ext = stages.find((s) => s.stage === "extrusion");
+  const mix = stages.find((s) => s.stage === "mixing");
+  const pack = stages.find((s) => s.stage === "packing");
+  const maxPct = Math.max(...stages.flatMap((s) => [s.starvedPct, s.blockedPct]));
+  return (
+    <div className="space-y-5">
+      <Card title="Flux mélange → extrusion → conditionnement" sub="Minutes-unités en attente, en part du temps planifié de chaque étape (7 unités par étape)">
+        <div className="grid grid-cols-1 md:grid-cols-[1fr_auto_1fr_auto_1fr] gap-3 items-stretch">
+          {stages.map((s, i) => {
+            const isB = s.stage === bottleneck;
+            return (
+              <React.Fragment key={s.stage}>
+                <div className="rounded-lg p-5" style={{ border: `2px solid ${isB ? C.accent : C.grid}`, background: isB ? "#FFF6EE" : "#fff" }}>
+                  <div className="flex justify-between items-center">
+                    <span className="text-xl font-semibold" style={{ color: C.navy }}>{STAGE_FR[s.stage]}</span>
+                    {isB && <span className="text-xs font-bold uppercase px-2 py-1 rounded" style={{ background: C.accent, color: "#fff" }}>Goulot</span>}
+                  </div>
+                  <div className="num text-sm mt-1" style={{ color: C.muted }}>{tons(s.output)} produites</div>
+                  <div className="mt-4 space-y-3">
+                    <div>
+                      <div className="flex justify-between text-sm"><span>Affamée (attend l'amont)</span><span className="num font-semibold">{pct(s.starvedPct)}</span></div>
+                      <HBar v={s.starvedPct} max={maxPct} color={C.navy3} />
+                    </div>
+                    <div>
+                      <div className="flex justify-between text-sm"><span>Bloquée (l'aval sature)</span><span className="num font-semibold">{pct(s.blockedPct)}</span></div>
+                      <HBar v={s.blockedPct} max={maxPct} color={C.navy} />
+                    </div>
+                  </div>
+                </div>
+                {i < stages.length - 1 && <div className="hidden md:flex items-center text-3xl" style={{ color: C.navy3 }}>→</div>}
+              </React.Fragment>
+            );
+          })}
+        </div>
+        <div className="mt-5 p-4 rounded" style={{ background: "#F4F5F7", borderLeft: `4px solid ${C.accent}` }}>
+          <p className="text-base" style={{ color: C.ink }}>
+            <b style={{ color: C.navy }}>Le goulot est l'{STAGE_FR[bottleneck].toLowerCase()}.</b>{" "}
+            Le mélange est bloqué {pct(mix.blockedPct)} du temps parce que l'extrusion n'absorbe pas son débit,
+            et le conditionnement attend l'extrusion {pct(pack.starvedPct)} du temps. L'extrusion, elle, n'est presque jamais
+            à l'arrêt pour cause de flux ({pct(ext.idlePct)}) : c'est elle qui fixe la cadence de l'usine.
+            Chaque point de TRS gagné en extrusion (aujourd'hui {pct(M.plant.oee)}) se retrouve directement en tonnes livrées.
+          </p>
+        </div>
+      </Card>
+
+      <Card title="Évolution hebdomadaire des attentes" sub="Signaux du goulot : blocage du mélange (amont) et famine du conditionnement (aval)">
+        <Legend items={[
+          { name: "Mélange bloqué", color: C.navy },
+          { name: "Conditionnement affamé", color: C.accent },
+          { name: "Extrusion affamée + bloquée", color: C.navy3 },
+        ]} />
+        <Lines data={M.stageWeekly}
+          series={[
+            { name: "Mélange bloqué", value: (d) => d.mixing.blockedPct, color: C.navy },
+            { name: "Cond. affamé", value: (d) => d.packing.starvedPct, color: C.accent },
+            { name: "Extrusion en attente", value: (d) => d.extrusion.idlePct, color: C.navy3 },
+          ]}
+          label={(d) => dShort(d.week)} fmt={fmtPct} width={1000} height={260} />
+      </Card>
+
+      <Card title="Tonnages par étape" sub="Cohérence du flux sur la période">
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+          {stages.map((s) => (
+            <div key={s.stage} className="rounded p-3" style={{ background: "#F4F5F7" }}>
+              <div className="text-xs uppercase tracking-wide" style={{ color: C.muted }}>{STAGE_FR[s.stage]}</div>
+              <div className="num text-2xl font-semibold" style={{ color: C.navy }}>{tons(s.output)}</div>
+            </div>
+          ))}
+        </div>
+        <p className="text-sm mt-3" style={{ color: C.muted }}>
+          Le tonnage d'extrusion du flux ({tons(ext.output)}) recoupe le journal des lignes après correction ({tons(M.plant.output)}).
+        </p>
+      </Card>
+    </div>
+  );
+}
+
+// ---------- Notes sur les données ----------
+function DataNotes({ M }) {
+  const c = M.clean;
+  const notes = [];
+  if (c.duplicates.length) notes.push(`${c.duplicates.length} lignes en double exact (${[...new Set(c.duplicates.map((r) => dLong(r.date) + ", équipe " + r.shift))].join(" ; ")}) : supprimées.`);
+  if (c.kgRows.length) notes.push(`${c.kgRows.length} relevés saisis en kg au lieu de tonnes (${c.kgRows.map((r) => `${r.machine} ${dShort(r.date)} ${r.shift} : ${nf0.format(r.raw)}`).join(" ; ")}) : divisés par 1 000. Le total recoupe alors le tonnage d'extrusion du flux.`);
+  if (M.missing.length) notes.push(`Équipe absente du journal : ${M.missing.map((m) => `${dLong(m.date)}, équipe ${m.shift}`).join(" ; ")}. Le flux journalier montre aussi un temps planifié réduit ce jour-là : traité comme un shift non planifié, pas une donnée perdue.`);
+  if (c.zeroPlanned.length) notes.push(`${c.zeroPlanned.length} relevés à 0 min planifiée (${[...new Set(c.zeroPlanned.map((r) => r.machine + " le " + dLong(r.date)))].join(" ; ")}) : ligne non planifiée, sans effet sur les sommes ; ratios protégés contre la division par zéro.`);
+  if (c.overStop.length) notes.push(`Arrêts déclarés supérieurs au temps planifié : ${c.overStop.map((r) => `${r.machine} ${dShort(r.date)} ${r.shift} (${r.stops} min pour ${r.planned})`).join(" ; ")}. run_min = 0 conservé tel quel.`);
+  return (
+    <Card title="Notes sur les données" sub="Anomalies détectées dans les fichiers sources et traitement appliqué (à confirmer avec le site)">
+      <ul className="list-disc pl-5 space-y-1.5 text-sm">
+        {notes.map((n, i) => <li key={i}>{n}</li>)}
+        <li>Cadence nominale identique pour les 7 lignes (2,3 t/h) : la performance compare chaque ligne à cette même référence.</li>
+      </ul>
+    </Card>
+  );
+}
+
+// ---------- Application ----------
+const TABS = [["overview", "Vue d'ensemble"], ["lines", "Lignes"], ["flow", "Flow"]];
+
+function App() {
+  const [state, setState] = useState({ status: "loading" });
+  const [tab, setTab] = useState("overview");
+  useEffect(() => {
+    Promise.all(["./extrusion_shift_log.csv", "./stage_daily.csv"].map((u) =>
+      fetch(u).then((r) => { if (!r.ok) throw new Error(`${u} : HTTP ${r.status}`); return r.text(); })))
+      .then(([a, b]) => setState({ status: "ok", M: buildModel(K.parseCSV(a), K.parseCSV(b)) }))
+      .catch((e) => setState({ status: "error", error: e.message }));
+  }, []);
+
+  if (state.status === "loading") return <div className="p-12 text-center" style={{ color: C.muted }}>Chargement des données de production…</div>;
+  if (state.status === "error") return (
+    <div className="max-w-xl mx-auto mt-16 card p-6">
+      <h1 className="text-lg font-semibold" style={{ color: C.accent }}>Impossible de charger les données</h1>
+      <p className="mt-2 text-sm">{state.error}</p>
+      <p className="mt-2 text-sm" style={{ color: C.muted }}>Les fichiers CSV doivent être servis à côté de index.html (ouvrir via un serveur, pas en file://).</p>
+    </div>
+  );
+  const M = state.M;
+  return (
+    <div>
+      <header style={{ background: C.navy }} className="text-white">
+        <div className="max-w-[1400px] mx-auto px-4 sm:px-6 py-4 flex flex-wrap items-end justify-between gap-3">
+          <div>
+            <h1 className="text-2xl sm:text-3xl font-semibold tracking-tight">Polymex — Cockpit usine</h1>
+            <div className="text-sm opacity-80">Période : {dLong(M.dates[0])} – {dLong(M.dates[M.dates.length - 1])} · {M.dates.length} jours · 7 lignes d'extrusion · 3 équipes</div>
+          </div>
+          <nav className="flex gap-1">
+            {TABS.map(([k, l]) => (
+              <button key={k} onClick={() => setTab(k)} className="px-4 py-2 rounded-t text-base font-semibold"
+                style={tab === k ? { background: "#F4F5F7", color: C.navy } : { color: "#fff", opacity: 0.85 }}>{l}</button>
+            ))}
+          </nav>
+        </div>
+      </header>
+      <main className="max-w-[1400px] mx-auto px-4 sm:px-6 py-6">
+        {tab === "overview" && <Overview M={M} />}
+        {tab === "lines" && <Lines_ M={M} />}
+        {tab === "flow" && <Flow M={M} />}
+      </main>
+      <footer className="max-w-[1400px] mx-auto px-4 sm:px-6 pb-8 text-xs" style={{ color: C.muted }}>
+        Indicateurs calculés dans le navigateur à partir de extrusion_shift_log.csv et stage_daily.csv. TRS = disponibilité × performance × qualité, agrégés par sommes.
+      </footer>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
