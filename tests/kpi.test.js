@@ -92,3 +92,25 @@ test("impacts : aucune division par zéro sur des données vides ou sans marche"
   i.problems.forEach((x) => { assert.ok(Number.isFinite(x.tonnes)); assert.ok(Number.isFinite(x.gainEur)); });
   assert.equal(i.problems.find((x) => x.id === "scrap").gainT, 0);
 });
+
+test("diagnostics : ligne hors norme en rebut, rebut avec / sans changement", () => {
+  const rows = ["M01", "M02", "M03"].flatMap((m, i) => [
+    row({ machine: m, output_t: 10, scrap_t: m === "M03" ? 1 : 0.6, changeovers: 1, changeover_min: 100 }),
+    row({ machine: m, date: "2026-02-02", output_t: 10, scrap_t: 0.6 }),
+  ]);
+  const d = K.diagnostics(rows);
+  assert.equal(d.scrapOutlier.key, "M03");
+  assert.equal(d.scrapRange.machines.max, 0.06);
+  assert.ok(Math.abs(d.scrapWithCo - 2.2 / 30) < 1e-12);
+  assert.ok(Math.abs(d.scrapWithoutCo - 0.06) < 1e-12);
+  assert.equal(d.minPerCoRange.machines.min, 100);
+  assert.equal(d.months.map((m) => m.key).join(","), "2026-01,2026-02");
+});
+
+test("diagnostics : données réelles nettoyées", () => {
+  const c = K.cleanShiftLog(K.parseCSV(fs.readFileSync(path.join(root, "extrusion_shift_log.csv"), "utf8")));
+  const d = K.diagnostics(c.rows);
+  assert.equal(d.plant.co, 800);
+  assert.equal(d.scrapOutlier.key, "M04");
+  assert.ok(Math.abs(d.scrapOutlier.scrapRate - 0.0695) < 5e-4);
+});

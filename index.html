@@ -188,8 +188,49 @@
       internalGainT: down.gainT + co.gainT + scrap.gainT };
   }
 
+  // Constats pour l'onglet « Questions usine » : rebut et changements de série par ligne, équipe et mois.
+  function diagnostics(rows) {
+    var seg = function (keyFn) {
+      var g = groupBy(rows, keyFn);
+      return Object.keys(g).sort().map(function (k) {
+        var o = oee(g[k]);
+        return { key: k, scrapRate: o.scrapRate, co: o.co, coMin: o.coMin, minPerCo: safeDiv(o.coMin, o.co),
+          days: Object.keys(groupBy(g[k], function (r) { return r.date; })).length };
+      });
+    };
+    var range = function (list, f) {
+      var v = list.map(f).filter(function (x) { return x !== null; });
+      return v.length ? { min: Math.min.apply(null, v), max: Math.max.apply(null, v) } : { min: null, max: null };
+    };
+    var median = function (v) {
+      var s = v.filter(function (x) { return x !== null; }).sort(function (a, b) { return a - b; }), n = s.length;
+      return n ? (n % 2 ? s[(n - 1) / 2] : (s[n / 2 - 1] + s[n / 2]) / 2) : null;
+    };
+    var machines = seg(function (r) { return r.machine; });
+    var shifts = seg(function (r) { return r.shift; });
+    var months = seg(function (r) { return r.date.slice(0, 7); });
+    // Ligne hors norme : la plus éloignée de la médiane, si l'écart dépasse 0,5 point de rebut.
+    var med = median(machines.map(function (m) { return m.scrapRate; }));
+    var outlier = machines.reduce(function (a, m) {
+      return m.scrapRate !== null && med !== null && Math.abs(m.scrapRate - med) > 0.005 &&
+        (!a || Math.abs(m.scrapRate - med) > Math.abs(a.scrapRate - med)) ? m : a;
+    }, null);
+    var rest = machines.filter(function (m) { return m !== outlier; });
+    var withCo = oee(rows.filter(function (r) { return r.changeovers > 0; }));
+    var withoutCo = oee(rows.filter(function (r) { return r.changeovers === 0; }));
+    return {
+      plant: oee(rows), machines: machines, shifts: shifts, months: months,
+      scrapOutlier: outlier, scrapMedian: med,
+      scrapRange: { machines: range(rest, function (m) { return m.scrapRate; }), shifts: range(shifts, function (m) { return m.scrapRate; }),
+        months: range(months, function (m) { return m.scrapRate; }) },
+      minPerCoRange: { machines: range(machines, function (m) { return m.minPerCo; }), shifts: range(shifts, function (m) { return m.minPerCo; }) },
+      scrapWithCo: withCo.scrapRate, scrapWithoutCo: withoutCo.scrapRate,
+      coPerDay: months.map(function (m) { return { key: m.key, perDay: safeDiv(m.co, m.days) }; })
+    };
+  }
+
   root.PolymexKPI = { safeDiv: safeDiv, parseCSV: parseCSV, cleanShiftLog: cleanShiftLog, missingShifts: missingShifts,
-    oee: oee, groupBy: groupBy, weekStart: weekStart, flow: flow, impacts: impacts, STAGES: STAGES };
+    oee: oee, groupBy: groupBy, weekStart: weekStart, flow: flow, impacts: impacts, diagnostics: diagnostics, STAGES: STAGES };
 })(typeof window !== "undefined" ? window : globalThis);
 </script>
 
@@ -962,6 +1003,199 @@ function Problems({ M, E, A }) {
   );
 }
 
+// ---------- Onglet 5 : questions usine ----------
+const Q_STORE_KEY = "polymex-cockpit-questions-v1";
+const Q_STATUS = [
+  { key: "open", label: "À creuser", bg: "#FDEBDD", fg: "#9A4A06" },
+  { key: "answered", label: "Réponse obtenue", bg: "#E9EEF6", fg: C.navy },
+  { key: "action", label: "Action décidée", bg: "#E6F2EC", fg: C.ok },
+];
+const Q_CARDS = [
+  { id: "capacity", title: "Capacité extrusion vs demande",
+    fields: [
+      { key: "demand", label: "Demande mensuelle", unit: "t/mois", type: "number" },
+      { key: "seasonality", label: "Saisonnalité", type: "text", placeholder: "Pics, creux, mois concernés…" },
+      { key: "comments", label: "Commentaires", type: "textarea" },
+    ] },
+  { id: "changeover", title: "Changements de série",
+    fields: [
+      { key: "cause", label: "Cause principale des ~100 min", type: "text" },
+      { key: "smed", label: "Pistes SMED évoquées", type: "textarea" },
+      { key: "comments", label: "Commentaires", type: "textarea" },
+    ] },
+  { id: "quality", title: "Qualité / rebut",
+    fields: [
+      { key: "rootCause", label: "Cause racine soupçonnée", type: "text" },
+      { key: "actions", label: "Actions prévues", type: "textarea" },
+      { key: "comments", label: "Commentaires", type: "textarea" },
+    ] },
+];
+
+function useQuestions() {
+  const [store, setStore] = useState(() => {
+    try { const s = JSON.parse(localStorage.getItem(Q_STORE_KEY) || "null"); if (s && typeof s === "object") return s; } catch (e) { /* ignoré */ }
+    return {};
+  });
+  useEffect(() => { try { localStorage.setItem(Q_STORE_KEY, JSON.stringify(store)); } catch (e) { /* ignoré */ } }, [store]);
+  const get = (id) => store[id] || { status: "open", fields: {} };
+  const update = (id, patch) => setStore((s) => {
+    const cur = s[id] || { status: "open", fields: {} };
+    return { ...s, [id]: { ...cur, ...patch, fields: { ...cur.fields, ...(patch.fields || {}) }, updatedAt: new Date().toISOString() } };
+  });
+  return { get, update, open: Q_CARDS.filter((c) => get(c.id).status === "open").length, reset: () => setStore({}) };
+}
+
+const pts = (a, b) => nf2.format(Math.abs(a - b) * 100) + " pt";
+const pct2 = (v) => (v === null || v === undefined ? "—" : nf2.format(v * 100) + " %");
+const rangeTxt = (r, f) => (r.min === null ? "—" : r.min === r.max ? f(r.min) : `${f(r.min)} – ${f(r.max)}`);
+const monthFr = (key) => MONTHS[Number(key.slice(5, 7)) - 1];
+
+// Constats chiffrés, recalculés depuis les données à chaque chargement.
+function findings(id, M, D, demand) {
+  if (id === "capacity") {
+    const st = Object.fromEntries(M.flow.stages.map((s) => [s.stage, s]));
+    const perMonth = 365 / 12 / M.dates.length;
+    const goodMonth = M.plant.good * perMonth, maxMonth = M.idealPlannedT * perMonth;
+    const isExt = M.flow.bottleneck === "extrusion";
+    const facts = [
+      <>Le conditionnement est affamé <b>{pct(st.packing.starvedPct)}</b> du temps planifié.</>,
+      <>L'extrusion n'est quasiment jamais bloquée (<b>{pct(st.extrusion.blockedPct)}</b>) ni affamée ({pct(st.extrusion.starvedPct)}).</>,
+      <>Le mélange est bloqué par l'aval <b>{pct(st.mixing.blockedPct)}</b> du temps.</>,
+      <>Production bonne actuelle de l'extrusion : <b>{tons(goodMonth)}/mois</b> ; plafond théorique à 100 % de TRS : {tons(maxMonth)}/mois.</>,
+    ];
+    const verdict = isExt
+      ? "L'extrusion est le goulot : elle fixe la cadence de l'usine. Toute tonne de demande supplémentaire passe par elle."
+      : `Le goulot calculé est ${STAGE_FR[M.flow.bottleneck] ? STAGE_FR[M.flow.bottleneck].toLowerCase() : "non identifié"} : revoir la question de capacité en conséquence.`;
+    let gap = null;
+    if (demand > 0) {
+      const d = demand - goodMonth;
+      gap = d > 0
+        ? <>Demande saisie : {tons(demand)}/mois, soit <b style={{ color: C.accent }}>{tons(d)}/mois de plus</b> que la production actuelle ({pct(K.safeDiv(d, goodMonth))}){demand > maxMonth ? ", au-delà même du plafond théorique : capacité supplémentaire nécessaire" : ", atteignable en améliorant le TRS"}.</>
+        : <>Demande saisie : {tons(demand)}/mois, couverte par la production actuelle (marge de {tons(-d)}/mois) : le sujet est alors le service, pas la capacité.</>;
+    }
+    return { facts, verdict, gap,
+      questions: ["Quelle est la demande réelle (carnet de commandes, prévisions) pour dimensionner la capacité extrusion ?",
+        "La demande est-elle saisonnière ? Les petites séries des deux clients retail vont-elles augmenter ?"] };
+  }
+  if (id === "changeover") {
+    const r = D.minPerCoRange, avg = K.safeDiv(D.plant.coMin, D.plant.co) || 0;
+    const spread = Math.max(r.machines.max - r.machines.min, r.shifts.max - r.shifts.min);
+    const homogeneous = avg > 0 && spread / avg < 0.1;
+    const first = D.coPerDay[0], last = D.coPerDay[D.coPerDay.length - 1];
+    const fmtMin = (v) => nf0.format(v) + " min";
+    return {
+      facts: [
+        <><b>{nf0.format(D.plant.co)}</b> changements sur la période, <b>{mins(D.plant.coMin)}</b>, soit <b>{pct(D.plant.coShare)}</b> du temps planifié.</>,
+        <>Durée moyenne : <b>{mins(avg)}</b> par changement ; par ligne {rangeTxt(r.machines, fmtMin)}, par équipe {rangeTxt(r.shifts, fmtMin)}.</>,
+        first && last && first !== last && <>Fréquence : {nf1.format(first.perDay)} changements/jour en {monthFr(first.key)} → <b>{nf1.format(last.perDay)}</b> en {monthFr(last.key)}.</>,
+      ].filter(Boolean),
+      verdict: homogeneous
+        ? "Durée quasi identique sur toutes les lignes et toutes les équipes : ce n'est pas un problème de compétences des opérateurs, mais de méthode de changement."
+        : `Écart de ${fmtMin(spread)} entre lignes ou équipes : comparer les pratiques des meilleures et des moins bonnes.`,
+      questions: ["Pourquoi environ " + fmtMin(avg) + " par changement ?", "Quelles sont les étapes du changement (arrêt, purge, nettoyage, redémarrage aux spécifications) ?",
+        "Quelle est la politique de tailles de lots, et a-t-elle changé avec les clients retail ?"] };
+  }
+  const R = D.scrapRange, o = D.scrapOutlier;
+  const spreadOk = (x) => x.min !== null && x.max - x.min < 0.005;
+  const uniform = spreadOk(R.machines) && spreadOk(R.shifts) && spreadOk(R.months);
+  const coGap = D.scrapWithCo !== null && D.scrapWithoutCo !== null ? D.scrapWithCo - D.scrapWithoutCo : null;
+  return {
+    facts: [
+      <>Taux de rebut global : <b>{pct2(D.plant.scrapRate)}</b> ({tons(D.plant.scrap)}).</>,
+      <>Par ligne{o ? ` (hors ${o.key})` : ""} : {rangeTxt(R.machines, pct2)} ; par équipe : {rangeTxt(R.shifts, pct2)} ; par mois : {rangeTxt(R.months, pct2)}.</>,
+      o && <>Exception : <b style={{ color: C.accent }}>{o.key} à {pct2(o.scrapRate)}</b>, {pts(o.scrapRate, D.scrapMedian)} au-dessus de la médiane des lignes.</>,
+      coGap !== null && <>Rebut des shifts avec changement : <b>{pct2(D.scrapWithCo)}</b> ; sans changement : <b>{pct2(D.scrapWithoutCo)}</b>.</>,
+    ].filter(Boolean),
+    verdict: [
+      uniform ? "Rebut uniforme sur lignes, équipes et mois : cause systémique (matière, recette, réglages standards)." : "Rebut variable selon les lignes, équipes ou mois : chercher les segments les plus touchés.",
+      o ? `${o.key} se détache : problème propre à la machine.` : null,
+      coGap !== null && Math.abs(coGap) < 0.005 ? "Le rebut n'est pas lié aux changements de série." : coGap !== null ? `Écart de ${pts(D.scrapWithCo, D.scrapWithoutCo)} selon la présence d'un changement : à investiguer.` : null,
+    ].filter(Boolean).join(" "),
+    questions: ["Quelle matière, recette ou quel réglage peut expliquer un rebut systémique de l'ordre de " + pct2(D.plant.scrapRate) + " ?",
+      o ? `Quel est l'historique de maintenance de ${o.key} ?` : "Une ligne présente-t-elle un historique de maintenance particulier ?"],
+  };
+}
+
+function QField({ f, value, onChange }) {
+  const cls = "w-full px-3 py-2 rounded border outline-none text-base";
+  const style = { borderColor: C.grid, background: "#fff" };
+  return (
+    <label className="block">
+      <span className="text-sm font-medium" style={{ color: C.navy }}>{f.label}</span>
+      {f.type === "textarea"
+        ? <textarea rows={3} className={cls + " mt-1"} style={style} value={value || ""} placeholder={f.placeholder} onChange={(e) => onChange(e.target.value)} />
+        : <div className="flex items-center rounded border mt-1" style={{ borderColor: C.grid, background: "#fff" }}>
+            <input type="text" inputMode={f.type === "number" ? "decimal" : undefined} className="num w-full px-3 py-2 outline-none rounded text-base"
+              value={value || ""} placeholder={f.placeholder} onChange={(e) => onChange(e.target.value)} aria-label={f.label} />
+            {f.unit && <span className="px-3 text-sm whitespace-nowrap" style={{ color: C.muted }}>{f.unit}</span>}
+          </div>}
+    </label>
+  );
+}
+
+function QuestionCard({ n, card, M, D, Q }) {
+  const s = Q.get(card.id), status = Q_STATUS.find((x) => x.key === s.status) || Q_STATUS[0];
+  const demand = Number(String(s.fields.demand || "").replace(/\s/g, "").replace(",", "."));
+  const F = findings(card.id, M, D, Number.isFinite(demand) ? demand : 0);
+  return (
+    <section className="card p-5" style={{ borderTop: `4px solid ${status.key === "open" ? C.accent : status.key === "action" ? C.ok : C.navy}` }}>
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="flex items-start gap-3">
+          <span className="num text-lg font-bold rounded w-9 h-9 flex items-center justify-center shrink-0" style={{ background: C.navy, color: "#fff" }}>{n}</span>
+          <div>
+            <h2 className="text-xl font-semibold" style={{ color: C.navy }}>{card.title}</h2>
+            {s.status === "open" && <span className="inline-block mt-1 text-xs font-semibold px-2 py-0.5 rounded" style={{ background: status.bg, color: status.fg }}>À creuser</span>}
+          </div>
+        </div>
+        <div className="flex rounded overflow-hidden border" role="group" aria-label="Statut" style={{ borderColor: C.grid }}>
+          {Q_STATUS.map((st) => (
+            <button key={st.key} onClick={() => Q.update(card.id, { status: st.key })} className="px-3 py-1.5 text-sm font-semibold"
+              aria-pressed={s.status === st.key}
+              style={s.status === st.key ? { background: st.fg, color: "#fff" } : { background: "#fff", color: C.muted }}>{st.label}</button>
+          ))}
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-5 mt-4">
+        <div>
+          <div className="text-xs font-bold uppercase tracking-wide mb-2" style={{ color: C.muted }}>Constats du cockpit</div>
+          <ul className="space-y-1.5 text-sm list-disc pl-5 num">{F.facts.map((f, i) => <li key={i}>{f}</li>)}</ul>
+          <p className="text-sm mt-3 p-3 rounded" style={{ background: "#F4F5F7", borderLeft: `4px solid ${C.navy}` }}>{F.verdict}</p>
+          <div className="text-xs font-bold uppercase tracking-wide mt-4 mb-2" style={{ color: C.muted }}>Questions à poser</div>
+          <ol className="space-y-1 text-base list-decimal pl-5" style={{ color: C.navy }}>{F.questions.map((q, i) => <li key={i}>{q}</li>)}</ol>
+        </div>
+        <div className="space-y-3">
+          <div className="text-xs font-bold uppercase tracking-wide" style={{ color: C.muted }}>Réponses du terrain</div>
+          {card.fields.map((f) => (
+            <QField key={f.key} f={f} value={s.fields[f.key]} onChange={(v) => Q.update(card.id, { fields: { [f.key]: v } })} />
+          ))}
+          {F.gap && <p className="num text-sm p-3 rounded" style={{ background: "#FFF6EE" }}>{F.gap}</p>}
+          {s.updatedAt && <div className="text-xs" style={{ color: C.muted }}>Dernière mise à jour : {new Date(s.updatedAt).toLocaleString("fr-FR", { dateStyle: "short", timeStyle: "short" })}</div>}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function Questions({ M, Q }) {
+  const D = useMemo(() => K.diagnostics(M.rows), [M]);
+  return (
+    <div className="space-y-5">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <p className="text-base" style={{ color: C.muted }}>
+          Questions d'investigation pour les visites et échanges avec les équipes. Les constats sont recalculés depuis les CSV ;
+          les réponses sont enregistrées dans ce navigateur. <b style={{ color: C.navy }}>{Q.open} sur {Q_CARDS.length}</b> à creuser.
+        </p>
+        <button className="text-sm font-semibold px-3 py-1.5 rounded border" style={{ color: C.navy, borderColor: C.grid, background: "#fff" }}
+          onClick={() => { if (window.confirm("Effacer toutes les réponses et remettre les statuts à « à creuser » ?")) Q.reset(); }}>
+          Réinitialiser les réponses
+        </button>
+      </div>
+      {Q_CARDS.map((c, i) => <QuestionCard key={c.id} n={i + 1} card={c} M={M} D={D} Q={Q} />)}
+    </div>
+  );
+}
+
 // ---------- Notes sur les données ----------
 function DataNotes({ M }) {
   const c = M.clean;
@@ -982,12 +1216,13 @@ function DataNotes({ M }) {
 }
 
 // ---------- Application ----------
-const TABS = [["overview", "Vue d'ensemble"], ["lines", "Lignes"], ["flow", "Flow"], ["problems", "Problèmes & impact"]];
+const TABS = [["overview", "Vue d'ensemble"], ["lines", "Lignes"], ["flow", "Flow"], ["problems", "Problèmes & impact"], ["questions", "Questions usine"]];
 
 function App() {
   const [state, setState] = useState({ status: "loading" });
   const [tab, setTab] = useState("overview");
   const A = useAssumptions();
+  const Q = useQuestions();
   const M0 = state.M;
   const E = useMemo(() => (M0 ? { values: A.values, impacts: K.impacts(M0.rows, M0.stageRows, A.lib) } : null),
     [M0, JSON.stringify(A.lib)]);
@@ -1022,7 +1257,12 @@ function App() {
             )}
             {TABS.map(([k, l]) => (
               <button key={k} onClick={() => setTab(k)} className="px-4 py-2 rounded-t text-base font-semibold"
-                style={tab === k ? { background: "#F4F5F7", color: C.navy } : { color: "#fff", opacity: 0.85 }}>{l}</button>
+                style={tab === k ? { background: "#F4F5F7", color: C.navy } : { color: "#fff", opacity: 0.85 }}>
+                {l}
+                {k === "questions" && Q.open > 0 && (
+                  <span className="ml-1.5 text-xs font-bold px-1.5 py-0.5 rounded" style={{ background: C.accent, color: "#fff" }}>{Q.open}</span>
+                )}
+              </button>
             ))}
           </nav>
         </div>
@@ -1032,6 +1272,7 @@ function App() {
         {tab === "lines" && <Lines_ M={M} E={E} />}
         {tab === "flow" && <Flow M={M} E={E} />}
         {tab === "problems" && <Problems M={M} E={E} A={A} />}
+        {tab === "questions" && <Questions M={M} Q={Q} />}
       </main>
       <footer className="max-w-[1400px] mx-auto px-4 sm:px-6 pb-8 text-xs" style={{ color: C.muted }}>
         Indicateurs calculés dans le navigateur à partir de extrusion_shift_log.csv et stage_daily.csv. TRS = disponibilité × performance × qualité, agrégés par sommes.
