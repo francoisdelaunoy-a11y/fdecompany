@@ -114,3 +114,73 @@ test("diagnostics : données réelles nettoyées", () => {
   assert.equal(d.scrapOutlier.key, "M04");
   assert.ok(Math.abs(d.scrapOutlier.scrapRate - 0.0695) < 5e-4);
 });
+
+// ---- Contrôle des données et familles MECE (onglet Problèmes & impact) ----
+const readRaw = () => K.parseCSV(fs.readFileSync(path.join(root, "extrusion_shift_log.csv"), "utf8"));
+const readStage = () => K.parseCSV(fs.readFileSync(path.join(root, "stage_daily.csv"), "utf8"));
+
+test("contrôle : doublons exacts vs contradictoires, valeurs hors échelle", () => {
+  const raw = [row(), row(), row({ machine: "M02" }), row({ machine: "M02", output_t: 10 }), row({ machine: "M06", output_t: 12750, scrap_t: 830 })];
+  const c = K.dataControl(raw, K.cleanShiftLog(raw).rows, []);
+  assert.equal(c.dupKeys.length, 2);
+  assert.equal(c.exactDupKeys, 1);
+  assert.equal(c.contradictoryDupKeys, 1); // non fusionné : les deux lignes M02 restent dans le retraité
+  assert.equal(c.removedRows, 1);
+  assert.equal(c.outOfScale.length, 1);
+  assert.equal(c.stageExtrusionT, null);
+  assert.equal(c.gapClean, null);
+});
+
+test("contrôle : bilan temps marche + arrêts vs planifié", () => {
+  const b = K.timeBalance([row({ run_min: 0, changeover_min: 409, unplanned_downtime_min: 42, other_stop_min: 33 }), row()]);
+  assert.equal(b.mismatches.length, 1);
+  assert.equal(b.mismatches[0].stops, 484);
+  assert.equal(b.mismatches[0].diff, 4);
+  assert.equal(b.diff, 4);
+});
+
+test("contrôle : ratio > 100 % non plafonné, division par zéro ⇒ null", () => {
+  const c = K.dataControl([row({ output_t: 36.8 })], [row()], []);
+  assert.ok(Math.abs(c.raw.performance - 2) < 1e-12);
+  assert.equal(c.overCapacity.raw, 1);
+  assert.equal(c.overCapacity.clean, 0);
+  const e = K.dataControl([], [], []);
+  assert.equal(e.raw.performance, null);
+  assert.equal(e.raw.oee, null);
+  assert.equal(e.period.start, null);
+  const f = K.meceFacts([], []);
+  assert.equal(f.B1.share, null);
+  assert.equal(f.B1.worst, null);
+  assert.equal(f.C.grossRate, null);
+  assert.equal(f.D.yield, null);
+});
+
+test("contrôle : données réelles brutes vs retraitées", () => {
+  const raw = readRaw(), clean = K.cleanShiftLog(raw).rows;
+  const c = K.dataControl(raw, clean, readStage());
+  assert.equal(c.raw.n, 1890);
+  assert.equal(c.clean.n, 1883);
+  assert.equal(c.dupKeys.length, 7);
+  assert.equal(c.contradictoryDupKeys, 0);
+  assert.equal(c.outOfScale.length, 3);
+  assert.ok(Math.abs(c.raw.output - 54217.7) < 0.05);
+  assert.ok(Math.abs(c.stageExtrusionT - 21923.4) < 0.05);
+  assert.ok(Math.abs(c.gapClean + 0.5) < 0.05);
+  assert.ok(Math.abs(c.raw.performance - 2.128) < 5e-4);
+  assert.equal(c.raw.co, 805);
+  assert.equal(c.clean.co, 800);
+  assert.equal(c.balanceRaw.mismatches.length, 1);
+  assert.equal(c.balanceRaw.mismatches[0].stops, 484);
+});
+
+test("familles MECE : constats calculés au périmètre retraité", () => {
+  const f = K.meceFacts(K.cleanShiftLog(readRaw()).rows, readStage());
+  assert.equal(f.B1.worst.machine, "M02");
+  assert.equal(f.B2.count, 800);
+  assert.equal(f.D.outlier.machine, "M04");
+  assert.equal(f.bottleneck, "extrusion");
+  assert.ok(Math.abs(f.B3.mixingBlocked - 0.1165) < 5e-4);
+  // L'identité de référence reconstitue les tonnes bonnes.
+  const r = f.reference;
+  assert.ok(Math.abs(r.plannedH * r.availability * r.grossRate * r.yield - r.goodT) < 1e-6);
+});

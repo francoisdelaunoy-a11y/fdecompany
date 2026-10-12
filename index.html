@@ -229,8 +229,93 @@
     };
   }
 
+  // ---- Onglet « Problèmes & impact » : contrôle des données et familles MECE ----
+  function sumOf(rows, f) { return rows.reduce(function (s, r) { return s + f(r); }, 0); }
+  function stopsOf(r) { return r.changeover_min + r.unplanned_downtime_min + r.other_stop_min; }
+
+  // Bilan temps : marche + arrêts vs planifié, ligne à ligne et en total.
+  function timeBalance(rows) {
+    var mismatches = rows.filter(function (r) { return Math.abs(r.run_min + stopsOf(r) - r.planned_min) > 1e-9; })
+      .map(function (r) {
+        return { date: r.date, shift: r.shift, machine: r.machine, planned: r.planned_min, run: r.run_min,
+          stops: stopsOf(r), diff: r.run_min + stopsOf(r) - r.planned_min };
+      });
+    var planned = sumOf(rows, function (r) { return r.planned_min; });
+    var run = sumOf(rows, function (r) { return r.run_min; });
+    var stops = sumOf(rows, stopsOf);
+    return { planned: planned, run: run, stops: stops, diff: run + stops - planned, mismatches: mismatches };
+  }
+
+  // Contrôle brut / retraité. Les ratios ne sont jamais plafonnés : une performance > 100 % reste visible.
+  function dataControl(rawRows, cleanRows, stageRows) {
+    var keyOf = function (r) { return r.date + "|" + r.shift + "|" + r.machine; };
+    var groups = groupBy(rawRows, keyOf);
+    var dupKeys = Object.keys(groups).filter(function (k) { return groups[k].length > 1; }).sort().map(function (k) {
+      var g = groups[k], first = JSON.stringify(g[0]);
+      return { key: k, count: g.length, exact: g.every(function (r) { return JSON.stringify(r) === first; }) };
+    });
+    var overCap = function (rows) {
+      return rows.filter(function (r) { return r.run_min > 0 && r.output_t > r.run_min / 60 * r.ideal_rate_tph; }).length;
+    };
+    var dates = Object.keys(groupBy(rawRows, function (r) { return r.date; })).sort();
+    var ext = stageRows.filter(function (r) { return r.stage === "extrusion"; });
+    var stageExt = ext.length ? sumOf(ext, function (r) { return r.output_t; }) : null;
+    var raw = oee(rawRows), clean = oee(cleanRows);
+    return {
+      period: { start: dates[0] || null, end: dates[dates.length - 1] || null, days: dates.length },
+      raw: raw, clean: clean,
+      dupKeys: dupKeys,
+      exactDupKeys: dupKeys.filter(function (d) { return d.exact; }).length,
+      contradictoryDupKeys: dupKeys.filter(function (d) { return !d.exact; }).length,
+      removedRows: rawRows.length - cleanRows.length,
+      outOfScale: rawRows.filter(function (r) { return r.output_t > KG_THRESHOLD_T; })
+        .map(function (r) { return { date: r.date, shift: r.shift, machine: r.machine, output: r.output_t, scrap: r.scrap_t }; }),
+      kgThreshold: KG_THRESHOLD_T,
+      balanceRaw: timeBalance(rawRows), balanceClean: timeBalance(cleanRows),
+      overCapacity: { raw: overCap(rawRows), clean: overCap(cleanRows) },
+      stageExtrusionT: stageExt,
+      gapRaw: stageExt === null ? null : raw.output - stageExt,
+      gapClean: stageExt === null ? null : clean.output - stageExt
+    };
+  }
+
+  // Constats par famille MECE, au périmètre des lignes fournies. null = non calculable.
+  function meceFacts(rows, stageRows) {
+    var p = oee(rows);
+    var lines = Object.keys(groupBy(rows, function (r) { return r.machine; })).sort().map(function (m) {
+      var o = oee(rows.filter(function (r) { return r.machine === m; })); o.machine = m; return o;
+    });
+    var worst = lines.reduce(function (a, b) { return !a || b.down > a.down ? b : a; }, null);
+    var others = lines.filter(function (l) { return l !== worst; });
+    var othersAvg = safeDiv(sumOf(others, function (l) { return l.down; }), others.length);
+    var f = flow(stageRows), st = {};
+    f.stages.forEach(function (s) { st[s.stage] = s; });
+    var runH = p.run / 60;
+    var d = diagnostics(rows);
+    return {
+      A: { plannedH: p.planned / 60, days: Object.keys(groupBy(rows, function (r) { return r.date; })).length,
+        lines: lines.length, shifts: Object.keys(groupBy(rows, function (r) { return r.shift; })).length },
+      B1: { minutes: p.down, share: safeDiv(p.down, p.planned),
+        worst: worst && worst.down > 0 ? { machine: worst.machine, minutes: worst.down, share: safeDiv(worst.down, worst.planned) } : null,
+        othersAvg: othersAvg, ratio: worst && othersAvg ? safeDiv(worst.down, othersAvg) : null, availability: p.availability },
+      B2: { count: p.co, minutes: p.coMin, perCo: safeDiv(p.coMin, p.co), share: p.coShare },
+      B3: { minutes: p.other, share: safeDiv(p.other, p.planned),
+        mixingBlocked: st.mixing ? st.mixing.blockedPct : null, extrusionBlocked: st.extrusion ? st.extrusion.blockedPct : null,
+        packingStarved: st.packing ? st.packing.starvedPct : null },
+      C: { grossRate: safeDiv(p.output, runH), standardRate: safeDiv(p.ideal, runH), performance: p.performance },
+      D: { yield: safeDiv(p.good, p.output), scrapRate: p.scrapRate, scrapT: p.scrap, goodT: p.good,
+        outlier: d.scrapOutlier ? { machine: d.scrapOutlier.key, scrapRate: d.scrapOutlier.scrapRate } : null, median: d.scrapMedian },
+      // Identité de référence : heures planifiées × disponibilité × cadence brute × rendement = tonnes bonnes.
+      reference: { plannedH: p.planned / 60, availability: p.availability, grossRate: safeDiv(p.output, runH),
+        yield: safeDiv(p.good, p.output), goodT: p.good },
+      bottleneck: f.bottleneck,
+      stages: f.stages
+    };
+  }
+
   root.PolymexKPI = { safeDiv: safeDiv, parseCSV: parseCSV, cleanShiftLog: cleanShiftLog, missingShifts: missingShifts,
-    oee: oee, groupBy: groupBy, weekStart: weekStart, flow: flow, impacts: impacts, diagnostics: diagnostics, STAGES: STAGES };
+    oee: oee, groupBy: groupBy, weekStart: weekStart, flow: flow, impacts: impacts, diagnostics: diagnostics,
+    timeBalance: timeBalance, dataControl: dataControl, meceFacts: meceFacts, STAGES: STAGES };
 })(typeof window !== "undefined" ? window : globalThis);
 </script>
 
@@ -283,6 +368,8 @@ function buildModel(shiftRaw, stageRaw) {
 
   return {
     clean, rows, dates, plant, machines, shifts, stageRows: stageClean,
+    // Lignes brutes conservées en lecture seule pour le contrôle brut / retraité de l'onglet Problèmes & impact.
+    rawRows: Object.freeze(shiftRaw.slice()), control: K.dataControl(shiftRaw, rows, stageClean),
     idealPlannedT: rows.reduce((s, r) => s + r.planned_min / 60 * r.ideal_rate_tph, 0),
     weeks: weekly(rows), weeklyOf: (m) => weekly(rows.filter((r) => r.machine === m)),
     missing: K.missingShifts(rows), flow, stageWeekly,
@@ -883,122 +970,603 @@ function FieldCard({ card, A }) {
   );
 }
 
-// ---------- Onglet 4 : problèmes et impact ----------
-function ProblemCard({ rank, pb, E, M, maxCost }) {
-  const v = E.values, I = E.impacts, rate = nf2.format(I.rate);
-  let title, detail, method, lever, leverText, extra = null, note = null;
-  if (pb.id === "bottleneck") {
-    const srcPct = K.safeDiv(pb.minutes, M.flow.stages.find((s) => s.stage === pb.source)?.planned || 0);
-    title = `Goulot du flux : ${pb.stage ? STAGE_FR[pb.stage].toLowerCase() : "non identifié"}`;
-    detail = pb.sourceKind === "blocked"
-      ? `${STAGE_THE[pb.source] || "L'amont"} est bloqué ${pct(srcPct)} de son temps faute de place en ${STAGE_FR[pb.stage]?.toLowerCase()} : capacité amont disponible mais non transformée.`
-      : `${STAGE_THE[pb.source] || "L'aval"} attend ${pct(srcPct)} de son temps.`;
-    method = `${nf0.format(pb.minutes)} min-unités de blocage (${(STAGE_FR[pb.source] || "").toLowerCase()}) ÷ 60 × ${nf2.format(pb.ratePerUnitHour)} t/h par unité en marche = ${tons(pb.tonnes)}`;
-    lever = "Capacité au goulot";
-    leverText = `Ajouter de la capacité d'extrusion (heures, débridage, 8e ligne) pour absorber ${nf0.format(v.bottleneckPct)} % du blocage amont. Gain à comparer au coût de l'investissement.`;
-    note = "Recoupe les pannes et les changements de série, qui limitent eux-mêmes l'extrusion : non additionné au total.";
-  } else if (pb.id === "downtime") {
-    const w = pb.worst;
-    title = "Pannes (arrêts non planifiés)";
-    detail = w ? `${w.machine} cumule ${mins(w.down)} de pannes, ${nf1.format(K.safeDiv(w.down, pb.othersAvgDown) || 0)} fois la moyenne des autres lignes (${mins(pb.othersAvgDown)}). Soit ${nf0.format(pb.minutes / 60 * v.operators)} heures-opérateur immobilisées sur l'usine.` : "";
-    method = `${nf0.format(pb.minutes)} min ÷ 60 × ${rate} t bonnes/h = ${tons(pb.tonnes)} ; coût = t × ${nf0.format(v.margin)} €/t + ${nf0.format(pb.minutes / 60)} h × ${nf0.format(v.downtimeCost)} €/h`;
-    lever = `Maintenance ciblée sur ${w ? w.machine : "la pire ligne"}`;
-    leverText = `Réduire de ${nf0.format(v.worstDownPct)} % les pannes de ${w ? w.machine : "la pire ligne"} (l'aligner sur la moyenne des autres lignes = −${nf0.format(pb.alignPct * 100)} %) : analyse des causes, préventif, pièces critiques.`;
-    const max = Math.max(...M.machines.map((m) => m.down));
-    extra = (
-      <div className="grid grid-cols-7 gap-2 mt-3 items-end" style={{ height: 70 }}>
-        {M.machines.map((m) => (
-          <div key={m.machine} className="flex flex-col items-center justify-end h-full" title={`${m.machine} : ${mins(m.down)}`}>
-            <div className="w-full rounded-sm" style={{ height: `${(K.safeDiv(m.down, max) || 0) * 48}px`, background: w && m.machine === w.machine ? C.accent : C.navy3 }} />
-            <span className="text-xs mt-1" style={{ color: w && m.machine === w.machine ? C.accent : C.muted, fontWeight: w && m.machine === w.machine ? 700 : 400 }}>{m.machine}</span>
-          </div>
-        ))}
-      </div>
-    );
-  } else if (pb.id === "changeover") {
-    title = "Temps perdu en changements de série";
-    detail = `${nf0.format(pb.count)} changements, ${mins(pb.avgMin)} en moyenne chacun, soit ${pct(M.plant.coShare)} du temps planifié.`;
-    method = `${nf0.format(pb.minutes)} min ÷ 60 × ${rate} t bonnes/h = ${tons(pb.tonnes)}`;
-    lever = "SMED";
-    leverText = `Réduire de ${nf0.format(v.smedPct)} % la durée des changements : préparation hors arrêt, purges standardisées, séquençage des recettes.`;
-  } else {
-    const mwh = pb.tonnes * v.energyKwhT / 1000;
-    title = "Rebut et retraitement";
-    detail = `${pct(pb.rate)} de la production brute. Énergie consommée par le rebut : ${nf0.format(mwh)} MWh, soit ${eur(mwh * v.energyPrice)} sur la période.`;
-    method = `Σ scrap_t = ${tons(pb.tonnes)} (rebut + retraité), valorisé à la marge`;
-    lever = "Plan qualité";
-    leverText = `Ramener le taux de rebut de ${pct(pb.rate)} à ${nf1.format(v.scrapTarget)} % : réglages au démarrage, contrôle matière, suivi par équipe.`;
-    if (pb.gainT === 0) note = "Le taux actuel est déjà sous la cible : aucun gain avec cette hypothèse.";
-  }
+// ---------- Onglet 4 : problèmes et impact (schéma MECE) ----------
+// Lecture « du constat au gain » : contrôle des données → familles de pertes → carte standard → cascade d'impact.
+// Aucun gain n'est affiché tant que le verrou n'est pas levé (données validées + entrées économiques renseignées).
+const MECE_STORE_KEY = "polymex-cockpit-mece-v1";
+
+function useMece() {
+  const [store, setStore] = useState(() => {
+    try {
+      const s = JSON.parse(localStorage.getItem(MECE_STORE_KEY) || "null");
+      if (s && typeof s === "object") return { checks: s.checks || {}, collect: s.collect || {}, fiches: s.fiches || {} };
+    } catch (e) { /* stockage indisponible : on repart à vide */ }
+    return { checks: {}, collect: {}, fiches: {} };
+  });
+  useEffect(() => { try { localStorage.setItem(MECE_STORE_KEY, JSON.stringify(store)); } catch (e) { /* ignoré */ } }, [store]);
+  return {
+    store,
+    setCheck: (k, v) => setStore((s) => ({ ...s, checks: { ...s.checks, [k]: v } })),
+    setCollect: (k, v) => setStore((s) => ({ ...s, collect: { ...s.collect, [k]: v } })),
+    setFiche: (code, patch) => setStore((s) => ({ ...s, fiches: { ...s.fiches, [code]: { ...(s.fiches[code] || {}), ...patch } } })),
+  };
+}
+
+// Valeur absente ou non finie : jamais NaN, Infinity ou 0 trompeur.
+const nc = (v, f) => (v === null || v === undefined || !Number.isFinite(v) ? "non calculable" : f(v));
+const pctNc = (v) => nc(v, (x) => nf1.format(x * 100) + " %");
+const filled = (v) => v !== undefined && v !== null && String(v).trim() !== "";
+
+const DATA_CHECKS = [
+  { key: "units", label: "Unités confirmées", detail: "t ou kg pour les valeurs hors échelle" },
+  { key: "duplicates", label: "Doublons expliqués", detail: "double import ou enregistrements réels" },
+  { key: "rates", label: "Standards de cadence validés", detail: "ideal_rate_tph par ligne et par recette" },
+  { key: "volumes", label: "Définition des volumes validée", detail: "brut, bon, retouché, vendu" },
+];
+
+// Entrées économiques. source : "q" = Questions usine, "field" = encart terrain existant, "collect" = nouveau champ.
+const COLLECT_ITEMS = [
+  { key: "demand", label: "Demande servable", source: "q", required: true, hint: "Saisie dans l'onglet Questions usine (carte capacité)." },
+  { key: "mix", label: "Mix par recette", source: "collect", required: true, placeholder: "Recettes, parts du volume…" },
+  { key: "recipeRate", label: "Cadence standard par recette", source: "collect", required: true, placeholder: "t/h par recette et par ligne" },
+  { key: "downstreamCap", label: "Capacité aval disponible (packing)", source: "collect", required: true, placeholder: "t/mois disponibles" },
+  { key: "margin", label: "Marge contributive €/t", source: "field", required: true, hint: "Encart « Vraie marge par tonne » ci-dessous." },
+  { key: "price", label: "Prix net et consommations", source: "field", required: false, hint: "Encarts prix, électricité et consommation ci-dessous." },
+  { key: "calendar", label: "Calendrier d'ouverture", source: "collect", required: true, placeholder: "Jours ouverts / an, équipes" },
+  { key: "stocks", label: "Stocks et encours", source: "collect", required: false, placeholder: "Stock initial / final, encours" },
+  { key: "planCosts", label: "Coûts du plan d'actions", source: "collect", required: true, placeholder: "€, par action" },
+  { key: "horizon", label: "Horizon de calcul", source: "collect", required: true, placeholder: "Ex. 12 mois à partir de…" },
+];
+
+function collectState(item, X, A, Q) {
+  if (item.source === "q") return filled(Q.get("capacity").fields.demand);
+  if (item.source === "field") return item.key === "price" ? A.confirmed("price") : A.confirmed(item.key);
+  return filled(X.store.collect[item.key]);
+}
+
+function lockState(X, A, Q) {
+  const checksOk = DATA_CHECKS.filter((c) => X.store.checks[c.key]).length;
+  const req = COLLECT_ITEMS.filter((i) => i.required);
+  const reqOk = req.filter((i) => collectState(i, X, A, Q)).length;
+  return { checksOk, checksTotal: DATA_CHECKS.length, reqOk, reqTotal: req.length,
+    locked: checksOk < DATA_CHECKS.length || reqOk < req.length };
+}
+
+function Pill({ tone = "warn", children }) {
+  const t = { warn: ["#FDEBDD", "#9A4A06"], ok: ["#E6F2EC", C.ok], info: ["#E9EEF6", C.navy], mute: ["#F4F5F7", C.muted] }[tone];
+  return <span className="inline-block text-xs font-semibold px-2 py-0.5 rounded whitespace-nowrap" style={{ background: t[0], color: t[1] }}>{children}</span>;
+}
+
+function Arrow({ down }) {
+  return <div className="flex items-center justify-center text-2xl leading-none select-none" style={{ color: C.navy3 }} aria-hidden="true">{down ? "↓" : "→"}</div>;
+}
+
+// ---- 0. Contrôle des données ----
+function DataControlCard({ M, X, lock }) {
+  const ctl = M.control, r = ctl.raw, c = ctl.clean;
+  const bal = ctl.balanceRaw;
+  const rows = [
+    ["Lignes du journal", nf0.format(r.n), nf0.format(c.n)],
+    ["Production brute", tons(r.output), tons(c.output)],
+    [`Écart vs étape extrusion (${nc(ctl.stageExtrusionT, tons)})`, nc(ctl.gapRaw, tons), nc(ctl.gapClean, tons)],
+    ["Rebut + retouche", tons(r.scrap), tons(c.scrap)],
+    ["Disponibilité", pctNc(r.availability), pctNc(c.availability)],
+    ["Performance", pctNc(r.performance), pctNc(c.performance), r.performance > 1 || c.performance > 1],
+    ["Qualité", pctNc(r.quality), pctNc(c.quality)],
+    ["TRS", pctNc(r.oee), pctNc(c.oee), r.oee > 1 || c.oee > 1],
+    ["Changements de série", nf0.format(r.co), nf0.format(c.co)],
+    ["Arrêts non planifiés", mins(r.down), mins(c.down)],
+    ["Shifts au-dessus de la cadence nominale", nf0.format(ctl.overCapacity.raw), nf0.format(ctl.overCapacity.clean), ctl.overCapacity.clean > 0],
+  ];
   return (
-    <section className="card p-5">
-      <div className="flex items-start justify-between gap-4">
-        <div className="flex items-start gap-3 flex-1 min-w-0">
-          <span className="num text-lg font-bold rounded w-9 h-9 flex items-center justify-center shrink-0"
-            style={{ background: rank === 1 ? C.accent : C.navy, color: "#fff" }}>{rank}</span>
-          <div>
-            <h3 className="text-lg font-semibold" style={{ color: C.navy }}>{title}</h3>
-            <p className="text-sm mt-0.5" style={{ color: C.ink }}>{detail}</p>
+    <section className="card p-5" style={{ borderTop: `4px solid ${C.accent}` }}>
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <h2 className="text-xl font-semibold" style={{ color: C.navy }}>0. Contrôle des données : verrou de calcul des impacts</h2>
+        <Pill tone={lock.locked ? "warn" : "ok"}>{lock.locked ? "Impact non validé" : "Entrées complètes"}</Pill>
+      </div>
+      <p className="mt-3 p-3 rounded text-sm font-medium" style={{ background: "#FFF6EE", color: "#9A4A06", borderLeft: `4px solid ${C.accent}` }}>
+        Données de démonstration. Unités, doublons, standards de cadence et définition des volumes à valider.
+      </p>
+
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 mt-4">
+        <div className="rounded p-4" style={{ background: "#F4F5F7" }}>
+          <h3 className="font-semibold" style={{ color: C.navy }}>1. Données brutes : anomalies détectées</h3>
+          <ul className="mt-2 space-y-2 text-sm list-disc pl-5 num">
+            <li>
+              {ctl.outOfScale.length} valeur{ctl.outOfScale.length > 1 ? "s" : ""} hors échelle (&gt; {ctl.kgThreshold} t par shift)
+              {ctl.outOfScale.length > 0 && <> : {ctl.outOfScale.map((o) => `${o.machine} ${dShort(o.date)} ${o.shift} = ${nf0.format(o.output)} t`).join(" ; ")}.</>}
+            </li>
+            <li>
+              {ctl.dupKeys.length} clé{ctl.dupKeys.length > 1 ? "s" : ""} date/équipe/machine dupliquée{ctl.dupKeys.length > 1 ? "s" : ""} :
+              {" "}{ctl.exactDupKeys} doublon{ctl.exactDupKeys > 1 ? "s" : ""} exact{ctl.exactDupKeys > 1 ? "s" : ""}, {ctl.contradictoryDupKeys} contradictoire{ctl.contradictoryDupKeys > 1 ? "s" : ""}
+              {ctl.dupKeys.length > 0 && <> ({[...new Set(ctl.dupKeys.map((d) => { const [dt, sh] = d.key.split("|"); return `${dLong(dt)}, équipe ${sh}`; }))].join(" ; ")})</>}.
+            </li>
+            <li>
+              Bilan temps : {bal.mismatches.length} shift{bal.mismatches.length > 1 ? "s" : ""} où marche + arrêts ≠ planifié
+              {bal.mismatches.length > 0 && <> ({bal.mismatches.map((m) => `${m.machine} ${dShort(m.date)} ${m.shift} : ${nf0.format(m.run)} + ${nf0.format(m.stops)} min pour ${nf0.format(m.planned)}`).join(" ; ")})</>}.
+              {" "}Total : {nf0.format(bal.run)} min de marche + {nf0.format(bal.stops)} min d'arrêts pour {nf0.format(bal.planned)} min planifiées (écart {bal.diff >= 0 ? "+" : ""}{nf0.format(bal.diff)} min).
+            </li>
+          </ul>
+        </div>
+        <div className="rounded p-4" style={{ background: "#F4F5F7" }}>
+          <h3 className="font-semibold" style={{ color: C.navy }}>2. Traitements appliqués par le cockpit</h3>
+          <p className="text-xs mt-0.5" style={{ color: C.muted }}>Hypothèses d'unité et d'import, à confirmer.</p>
+          <ul className="mt-2 space-y-2 text-sm list-disc pl-5 num">
+            <li>Doublons exacts retirés : {nf0.format(ctl.removedRows)} ligne{ctl.removedRows > 1 ? "s" : ""}, une occurrence conservée.</li>
+            {ctl.contradictoryDupKeys > 0 && <li>{ctl.contradictoryDupKeys} clé(s) contradictoire(s) conservée(s) telles quelles : non fusionnées.</li>}
+            <li>Valeurs &gt; {ctl.kgThreshold} t par shift et leur rebut divisés par 1 000 (hypothèse kg → t).</li>
+            <li>Bilan temps incohérent conservé tel quel : run_min non recalculé.</li>
+            <li>Les autres onglets utilisent ce même retraitement.</li>
+          </ul>
+        </div>
+        <div className="rounded p-4" style={{ background: "#F4F5F7" }}>
+          <h3 className="font-semibold" style={{ color: C.navy }}>3. Résultats retraités</h3>
+          <p className="text-xs mt-0.5" style={{ color: C.muted }}>Cohérents avec le flux, mais ne valent pas validation terrain.</p>
+          <ul className="mt-2 space-y-2 text-sm list-disc pl-5 num">
+            <li>Production brute retraitée : {tons(c.output)}, écart résiduel {nc(ctl.gapClean, tons)} avec l'étape extrusion (écart brut : {nc(ctl.gapRaw, tons)}).</li>
+            <li>Performance retraitée {pctNc(c.performance)} (brute {pctNc(r.performance)}, non plafonnée).</li>
+            <li>Chaque chiffre de l'onglet annonce son périmètre : brut ou retraité.</li>
+          </ul>
+        </div>
+      </div>
+
+      <div className="mt-4">
+        <div className="grid grid-cols-[minmax(0,1fr)_auto_auto] gap-x-4 text-sm num">
+          <div className="py-2 text-xs font-bold uppercase tracking-wide" style={{ color: C.muted, borderBottom: `1px solid ${C.grid}` }}>Indicateur</div>
+          <div className="py-2 text-xs font-bold uppercase tracking-wide text-right" style={{ color: C.muted, borderBottom: `1px solid ${C.grid}` }}>Brut</div>
+          <div className="py-2 text-xs font-bold uppercase tracking-wide text-right" style={{ color: C.muted, borderBottom: `1px solid ${C.grid}` }}>Retraité</div>
+          {rows.map(([l, a, b, warn]) => (
+            <React.Fragment key={l}>
+              <div className="py-1.5" style={{ borderBottom: `1px solid ${C.grid}` }}>{l}</div>
+              <div className="py-1.5 text-right whitespace-nowrap" style={{ borderBottom: `1px solid ${C.grid}`, color: warn ? C.accent : C.ink, fontWeight: warn ? 600 : 400 }}>{a}</div>
+              <div className="py-1.5 text-right whitespace-nowrap" style={{ borderBottom: `1px solid ${C.grid}` }}>{b}</div>
+            </React.Fragment>
+          ))}
+        </div>
+        <p className="text-xs mt-2" style={{ color: C.muted }}>En orange : ratio supérieur à 100 %, physiquement incohérent. Il est affiché tel quel, jamais plafonné.</p>
+      </div>
+
+      <div className="mt-4 p-4 rounded" style={{ border: `1px solid ${C.grid}` }}>
+        <div className="flex flex-wrap items-baseline justify-between gap-2">
+          <h3 className="font-semibold" style={{ color: C.navy }}>Verrou des impacts : {lock.locked ? "fermé" : "entrées complètes"}</h3>
+          <span className="text-sm num" style={{ color: C.muted }}>Données validées {lock.checksOk}/{lock.checksTotal} · Entrées économiques {lock.reqOk}/{lock.reqTotal}</span>
+        </div>
+        <p className="text-sm mt-1" style={{ color: C.muted }}>Le retraitement seul ne déverrouille pas les impacts. Cocher seulement après confirmation par l'usine.</p>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 mt-3">
+          {DATA_CHECKS.map((d) => (
+            <label key={d.key} className="flex items-start gap-2 text-sm cursor-pointer">
+              <input type="checkbox" className="mt-1" checked={!!X.store.checks[d.key]} onChange={(e) => X.setCheck(d.key, e.target.checked)} style={{ accentColor: C.ok }} />
+              <span><b style={{ color: C.navy }}>{d.label}</b> <span style={{ color: C.muted }}>({d.detail})</span></span>
+            </label>
+          ))}
+        </div>
+      </div>
+
+      <details className="mt-4">
+        <summary className="cursor-pointer text-sm font-semibold" style={{ color: C.navy }}>Période, sources, périmètre et formules</summary>
+        <div className="mt-3 grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
+          <div className="space-y-1.5">
+            <p><b>Période :</b> {ctl.period.start ? `${dLong(ctl.period.start)} – ${dLong(ctl.period.end)} (${ctl.period.days} jours)` : "non calculable"}.</p>
+            <p><b>Sources :</b> extrusion_shift_log.csv ({nf0.format(r.n)} lignes brutes), stage_daily.csv ({nf0.format(M.stageRows.length)} lignes).</p>
+            <p><b>Périmètre brut :</b> toutes les lignes telles que déclarées.</p>
+            <p><b>Périmètre retraité :</b> doublons exacts retirés, valeurs hors échelle divisées par 1 000. Hypothèses non validées.</p>
           </div>
+          <ul className="space-y-1 text-xs" style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", color: C.muted }}>
+            <li>Disponibilité = Σ run_min / Σ planned_min</li>
+            <li>Performance = Σ output_t / Σ (run_min / 60 × ideal_rate_tph)</li>
+            <li>Qualité = Σ (output_t − scrap_t) / Σ output_t</li>
+            <li>TRS = disponibilité × performance × qualité</li>
+            <li>Bilan temps = run + changeover + unplanned_downtime + other_stop − planned</li>
+            <li>Écart = Σ output_t (journal) − Σ output_t (stage_daily, extrusion)</li>
+          </ul>
         </div>
-        <div className="text-right shrink-0">
-          <div className="num text-3xl font-semibold whitespace-nowrap" style={{ color: C.navy }}>{tons(pb.tonnes)}</div>
-          <div className="text-xs" style={{ color: C.muted }}>perdues sur {I.days} jours</div>
-        </div>
-      </div>
-      <div className="mt-3"><HBar v={pb.cost} max={maxCost} color={rank === 1 ? C.accent : C.navy} h={8} /></div>
-      <div className="num flex flex-wrap gap-x-6 gap-y-1 mt-2 text-sm">
-        <span>Coût sur la période : <b>{eur(pb.cost)}</b></span>
-        <span>Annualisé : <b>{eur(pb.cost * I.annual)}/an</b></span>
-        <span style={{ color: C.muted }}>CA non réalisé : {eur(pb.tonnes * v.price)}</span>
-      </div>
-      <div className="num text-xs mt-2 px-3 py-2 rounded" style={{ background: "#F4F5F7", color: C.muted, fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>
-        Méthode : {method}
-      </div>
-      {extra}
-      <div className="mt-4 p-4 rounded flex flex-wrap justify-between gap-4" style={{ border: `1px solid ${C.grid}`, borderLeft: `4px solid ${C.ok}` }}>
-        <div className="flex-1 min-w-[240px]">
-          <div className="text-xs font-bold uppercase tracking-wide" style={{ color: C.ok }}>Levier : {lever}</div>
-          <p className="text-sm mt-1">{leverText}</p>
-        </div>
-        <div className="text-right">
-          <div className="num text-2xl font-semibold" style={{ color: C.ok }}>+{eur(pb.gainEur)}/an</div>
-          <div className="num text-xs" style={{ color: C.muted }}>+{tons(pb.gainT)} bonnes par an</div>
-        </div>
-      </div>
-      {note && <p className="text-xs mt-2" style={{ color: C.muted }}>{note}</p>}
+      </details>
     </section>
   );
 }
 
-function Problems({ M, E, A }) {
-  const I = E.impacts, maxCost = Math.max(...I.problems.map((p) => p.cost), 0);
-  const bn = I.problems.find((p) => p.id === "bottleneck");
+// ---- Familles MECE : une seule structure pour le tableau desktop et les cartes mobiles ----
+function meceFamilies(F, ctl, A) {
+  const fmtMin = (v) => nc(v, (x) => nf0.format(x) + " min");
+  return [
+    { code: "A", name: "Temps ouvert / capacité",
+      facts: [
+        `${nc(F.A.plannedH, (x) => nf0.format(x) + " h")} planifiées sur ${F.A.days} jours (${F.A.lines} lignes, ${F.A.shifts} équipes), périmètre retraité.`,
+        "Demande et mix : à collecter.",
+        `Flux compatible avec une contrainte en ${F.bottleneck ? STAGE_FR[F.bottleneck].toLowerCase() : "étape non identifiée"} : pas une preuve de besoin d'investissement.`,
+      ],
+      question: "Quelle demande par recette, quel besoin d'heures et d'unités ?",
+      lever: "Rééquilibrer (calendrier, mix, séquencement) avant d'ajouter de la capacité." },
+    { code: "B1", name: "Arrêts non planifiés",
+      facts: [
+        `${fmtMin(F.B1.minutes)} de pannes, ${pctNc(F.B1.share)} du planifié (retraité ; brut : ${fmtMin(ctl.raw.down)}).`,
+        F.B1.worst ? `Ligne la plus touchée : ${F.B1.worst.machine}, ${fmtMin(F.B1.worst.minutes)}, ${nc(F.B1.ratio, (x) => nf1.format(x) + " ×")} la moyenne des autres lignes.` : "Ligne la plus touchée : non calculable.",
+      ],
+      question: "Quels modes de panne, quels temps de réparation ?",
+      lever: "Maintenance ciblée à tester sur la ligne la plus touchée." },
+    { code: "B2", name: "Changements de série",
+      facts: [
+        `${nf0.format(F.B2.count)} changements, ${fmtMin(F.B2.minutes)}, ${fmtMin(F.B2.perCo)} par changement, ${pctNc(F.B2.share)} du planifié (retraité ; brut : ${nf0.format(ctl.raw.co)} changements). Indicatif, non validé.`,
+        "Une durée comparable entre équipes ne démontre pas l'absence de problème de compétences.",
+      ],
+      question: "Durée × fréquence : quelles étapes internes et externes ? Quelle politique de tailles de lots ?",
+      lever: "SMED, séquencement des recettes, tailles de lots." },
+    { code: "B3", name: "Autres arrêts",
+      facts: [
+        `${fmtMin(F.B3.minutes)} d'other_stop_min, ${pctNc(F.B3.share)} du planifié : code agrégé, non détaillé.`,
+        `stage_daily (fichier distinct) : mélange bloqué ${pctNc(F.B3.mixingBlocked)}, extrusion bloquée ${pctNc(F.B3.extrusionBlocked)}, conditionnement sans alimentation ${pctNc(F.B3.packingStarved)}.`,
+      ],
+      question: "Attente matière ou aval, pauses, nettoyage, utilités, autres ?",
+      lever: "Relier les deux journaux sans additionner deux symptômes de la même minute perdue." },
+    { code: "C", name: "Cadence en marche",
+      facts: [
+        `${nc(F.C.grossRate, (x) => nf2.format(x) + " t")} brutes par heure de marche vs ${nc(F.C.standardRate, (x) => nf2.format(x) + " t/h")} de référence : performance ${pctNc(F.C.performance)} (retraité ; brut : ${pctNc(ctl.raw.performance)}).`,
+        "Référentiel de cadence à confirmer : identique pour les 7 lignes, sans recette.",
+      ],
+      question: "Vitesse standard par recette, micro-arrêts, réglages, vitesse réelle ?",
+      lever: "Un micro-arrêt est imputé au temps OU à la cadence, jamais aux deux." },
+    { code: "D", name: "Qualité / rendement",
+      facts: [
+        `Rendement ${pctNc(F.D.yield)} (tonnes bonnes / tonnes brutes) ; rebut + retouche non vendable ${nc(F.D.scrapRate, pct2)}, retraité, à valider.`,
+        F.D.outlier ? `Ligne hors norme calculée : ${F.D.outlier.machine} à ${pct2(F.D.outlier.scrapRate)} (médiane ${nc(F.D.median, pct2)}). Hypothèse, pas un problème machine démontré.` : "Aucune ligne hors norme calculée.",
+      ],
+      question: "Défauts, lots matière, recettes, réglages, maintenance, compétences ?",
+      lever: "Hypothèses à tester : aucune cause n'est confirmée par les données." },
+    { code: "E", name: "Marge par tonne",
+      facts: [
+        "Prix net, mix et coûts variables : non documentés par les CSV, à collecter.",
+        A.confirmed("margin") ? `Marge saisie par l'usine : ${nf0.format(A.values.margin)} €/t.` : `Marge par défaut de la démonstration : ${nf0.format(A.values.margin)} €/t, hypothèse non validée.`,
+      ],
+      question: "Prix net et consommations × prix (matière, énergie, main-d'œuvre variable) ?",
+      lever: "Un rebut compté en D peut être rattaché ici, mais pas valorisé une seconde fois." },
+    { code: "F", name: "Charges fixes",
+      facts: ["P&L et coûts fixes non fournis : à collecter."],
+      question: "Effectifs fixes, amortissements, structure : réel vs budget à périmètre constant ?",
+      lever: "Séparer variable et fixe une seule fois." },
+  ];
+}
+
+function MeceTable({ fams }) {
   return (
-    <div className="space-y-5">
-      <div className="grid grid-cols-1 xl:grid-cols-3 gap-5 items-start">
-        <div className="xl:col-span-2 space-y-5">
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-            <Kpi label="Gain des 3 leviers internes" value={`${eur(I.internalGainEur)}/an`} note={`+${tons(I.internalGainT)} bonnes par an (SMED, maintenance, qualité)`} />
-            <Kpi label="Plafond capacité goulot" value={`${eur(bn.gainEur)}/an`} alert note="Non additif : recoupe pannes et changements" />
-            <Kpi label="Marge retenue" value={`${nf0.format(E.values.margin)} €/t`}
-              note={A.confirmed("margin") ? "Valeur terrain" : "Hypothèse, à confirmer avec l'usine"} />
+    <Card title="Après validation : classement par familles de pertes"
+      sub="Une perte dans une seule famille. Constats au périmètre annoncé, non validés ; ordre de lecture A → F, sans classement par gain supposé.">
+      <div className="hidden md:block">
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="text-xs uppercase tracking-wide text-left" style={{ color: C.muted, borderBottom: `1px solid ${C.grid}` }}>
+              <th className="py-2 pr-3 w-14">Code</th><th className="py-2 pr-3 w-44">Famille MECE</th>
+              <th className="py-2 pr-3">Constat disponible</th><th className="py-2">Question / levier à tester</th>
+            </tr>
+          </thead>
+          <tbody>
+            {fams.map((f) => (
+              <tr key={f.code} className="align-top" style={{ borderBottom: `1px solid ${C.grid}` }}>
+                <td className="py-3 pr-3"><span className="num font-bold text-base" style={{ color: C.navy }}>{f.code}</span></td>
+                <td className="py-3 pr-3 font-semibold" style={{ color: C.navy }}>{f.name}</td>
+                <td className="py-3 pr-3 num"><ul className="space-y-1">{f.facts.map((x, i) => <li key={i}>{x}</li>)}</ul></td>
+                <td className="py-3"><p style={{ color: C.navy }}>{f.question}</p><p className="mt-1" style={{ color: C.muted }}>{f.lever}</p></td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <div className="md:hidden space-y-3">
+        {fams.map((f) => (
+          <div key={f.code} className="rounded p-4" style={{ background: "#F4F5F7" }}>
+            <div className="flex items-baseline gap-2">
+              <span className="num font-bold text-lg" style={{ color: C.navy }}>{f.code}</span>
+              <span className="font-semibold" style={{ color: C.navy }}>{f.name}</span>
+            </div>
+            <div className="text-xs font-bold uppercase tracking-wide mt-2" style={{ color: C.muted }}>Constat disponible</div>
+            <ul className="text-sm space-y-1 mt-1 num">{f.facts.map((x, i) => <li key={i}>{x}</li>)}</ul>
+            <div className="text-xs font-bold uppercase tracking-wide mt-2" style={{ color: C.muted }}>Question / levier à tester</div>
+            <p className="text-sm mt-1" style={{ color: C.navy }}>{f.question}</p>
+            <p className="text-sm mt-1" style={{ color: C.muted }}>{f.lever}</p>
           </div>
-          <p className="text-sm" style={{ color: C.muted }}>
-            Problèmes classés du plus coûteux au moins coûteux sur la période. Tonnes perdues = tonnes bonnes non produites,
-            au débit réel de l'extrusion ({nf2.format(I.rate)} t bonnes par heure de marche et par ligne). Annualisation × 365 / {I.days} jours.
-            L'extrusion étant le goulot, chaque tonne qu'elle gagne est supposée vendue : à confirmer avec la direction commerciale.
-          </p>
-          {I.problems.map((pb, i) => <ProblemCard key={pb.id} rank={i + 1} pb={pb} E={E} M={M} maxCost={maxCost} />)}
+        ))}
+      </div>
+      <div className="mt-4 p-3 rounded text-sm" style={{ background: "#E9EEF6", color: C.navy }}>
+        <b>Filtres, pas nouvelles pertes :</b> mixing / extrusion / packing · ligne · shift · recette · cause · responsable
+        <div className="text-xs mt-1" style={{ color: C.muted }}>
+          Le goulot localise la contrainte : ce n'est pas une famille de pertes à additionner. Recette, cause et responsable sont absents des fichiers : champs à renseigner dans les fiches ci-dessous.
         </div>
-        <AssumptionsPanel A={A} />
+      </div>
+    </Card>
+  );
+}
+
+// ---- Carte standard : du constat à l'action ----
+const CHAIN_1 = ["Constat + source", "Famille primaire", "Hypothèse causale", "Test terrain", "Action / responsable"];
+const CHAIN_2 = ["Cible validée", "Tonnes bonnes nettes récupérables", "Gain net en €/an", "Niveau de confiance"];
+const Q_LINK = { A: "capacity", B2: "changeover", D: "quality" };
+
+function Chain({ steps }) {
+  return (
+    <div className="flex flex-col md:flex-row md:flex-wrap md:items-center gap-1.5">
+      {steps.map((s, i) => (
+        <React.Fragment key={s}>
+          <span className="rounded px-3 py-1.5 text-sm font-semibold text-center" style={{ background: "#E9EEF6", color: C.navy }}>{s}</span>
+          {i < steps.length - 1 && <><span className="hidden md:inline" style={{ color: C.navy3 }}>→</span><span className="md:hidden text-center" style={{ color: C.navy3 }}>↓</span></>}
+        </React.Fragment>
+      ))}
+    </div>
+  );
+}
+
+function FField({ label, children }) {
+  return <label className="block"><span className="text-sm font-medium" style={{ color: C.navy }}>{label}</span><div className="mt-1">{children}</div></label>;
+}
+const inputCls = "w-full px-3 py-2 rounded border outline-none text-base bg-white";
+
+function StandardCard({ fams, X, Q, M, lock }) {
+  const [code, setCode] = useState("A");
+  const fam = fams.find((f) => f.code === code);
+  const fi = X.store.fiches[code] || {};
+  const set = (k) => (e) => X.setFiche(code, { [k]: e.target.type === "checkbox" ? e.target.checked : e.target.value });
+  const q = Q_LINK[code] ? Q.get(Q_LINK[code]) : null;
+  const qLabel = q ? (Q_STATUS.find((s) => s.key === q.status) || Q_STATUS[0]).label : null;
+  const sel = (k, opts) => (
+    <select className={inputCls} style={{ borderColor: C.grid }} value={fi[k] || ""} onChange={set(k)}>
+      <option value="">—</option>{opts.map((o) => <option key={o} value={o}>{o}</option>)}
+    </select>
+  );
+  const txt = (k, ph) => <input type="text" className={inputCls} style={{ borderColor: C.grid }} value={fi[k] || ""} placeholder={ph} onChange={set(k)} />;
+  return (
+    <Card title="Carte standard : du constat à l'action" sub="Une seule famille primaire par problème. Étape, ligne, équipe et 5M sont des étiquettes transverses, pas des familles additives.">
+      <div className="space-y-2">
+        <Chain steps={CHAIN_1} />
+        <div className="md:hidden text-center" style={{ color: C.navy3 }}>↓</div>
+        <Chain steps={CHAIN_2} />
       </div>
 
-      <Card title="À collecter sur le terrain" sub={`Données à demander aux équipes de l'usine. ${A.pending} sur ${FIELD_CARDS.length} restent à confirmer ; tant qu'un encart est vide, la valeur par défaut est utilisée.`}>
-        <div key={A.resetKey} className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-          {FIELD_CARDS.map((c) => <FieldCard key={c.key} card={c} A={A} />)}
+      <div className="flex flex-wrap gap-2 mt-5" role="tablist" aria-label="Famille primaire">
+        {fams.map((f) => {
+          const st = X.store.fiches[f.code] || {};
+          return (
+            <button key={f.code} onClick={() => setCode(f.code)} role="tab" aria-selected={code === f.code}
+              className="px-3 py-1.5 rounded text-sm font-semibold border num"
+              style={code === f.code ? { background: C.navy, color: "#fff", borderColor: C.navy } : { color: C.navy, borderColor: C.grid, background: "#fff" }}>
+              {f.code}{st.cause === "confirmée" ? " ✓" : ""}
+            </button>
+          );
+        })}
+      </div>
+
+      <div className="mt-4 rounded p-4" style={{ border: `1px solid ${C.grid}` }}>
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <h3 className="font-semibold" style={{ color: C.navy }}>Fiche {fam.code} · famille primaire : {fam.name}</h3>
+          <div className="flex flex-wrap gap-1.5">
+            {fi.cause === "confirmée" ? <Pill tone="ok">Cause confirmée</Pill> : <Pill tone="warn">À vérifier</Pill>}
+            {fi.actionDecided && <Pill tone="info">Action décidée</Pill>}
+          </div>
         </div>
-      </Card>
+        <div className="text-sm mt-2 p-3 rounded num" style={{ background: "#F4F5F7" }}>
+          <span className="text-xs font-bold uppercase tracking-wide" style={{ color: C.muted }}>Constat calculé · source extrusion_shift_log / stage_daily</span>
+          <div className="mt-1">{fam.facts[0]}</div>
+        </div>
+        {q && (
+          <p className="text-xs mt-2" style={{ color: C.muted }}>
+            Réponses terrain associées : onglet Questions usine (statut « {qLabel} »). Elles restent la source pour ce sujet.
+          </p>
+        )}
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-4">
+          <FField label="Constat terrain + source">{txt("constat", "Ex. relevé maintenance du…")}</FField>
+          <FField label="Hypothèse causale">{txt("hypothesis")}</FField>
+          <FField label="Test terrain">{txt("test", "Comment la vérifier, sur quelles données")}</FField>
+          <FField label="Action">{txt("action")}</FField>
+          <FField label="Responsable">{txt("owner")}</FField>
+          <div className="grid grid-cols-2 gap-3">
+            <FField label="Étape">{sel("stage", ["mixing", "extrusion", "packing"])}</FField>
+            <FField label="Ligne">{sel("line", ["toutes", ...M.machines.map((m) => m.machine)])}</FField>
+            <FField label="Équipe">{sel("shift", ["toutes", "A", "B", "C"])}</FField>
+            <FField label="5M">{sel("m5", ["Matière", "Machine", "Méthode", "Main-d'œuvre", "Milieu"])}</FField>
+          </div>
+        </div>
+
+        <div className="flex flex-wrap gap-x-6 gap-y-2 mt-4 text-sm">
+          <span className="font-medium" style={{ color: C.navy }}>Cause :</span>
+          {["à vérifier", "confirmée"].map((v) => (
+            <label key={v} className="flex items-center gap-1.5 cursor-pointer">
+              <input type="radio" name={`cause-${code}`} checked={(fi.cause || "à vérifier") === v} onChange={() => X.setFiche(code, { cause: v })} style={{ accentColor: C.navy }} />
+              {v === "confirmée" ? "cause confirmée" : "à vérifier"}
+            </label>
+          ))}
+          <label className="flex items-center gap-1.5 cursor-pointer">
+            <input type="checkbox" checked={!!fi.actionDecided} onChange={set("actionDecided")} style={{ accentColor: C.navy }} /> action décidée
+          </label>
+        </div>
+        <p className="text-xs mt-1" style={{ color: C.muted }}>Saisir une action ne confirme pas la cause : les deux statuts sont indépendants.</p>
+
+        <div className="grid grid-cols-1 md:grid-cols-4 gap-3 mt-4">
+          <FField label="Cible validée">{txt("target", "Ex. −30 % de durée")}</FField>
+          <FField label="Tonnes bonnes nettes récupérables">
+            <input type="text" inputMode="decimal" className={inputCls} style={{ borderColor: C.grid, background: lock.locked ? "#F4F5F7" : "#fff" }}
+              disabled={lock.locked} value={lock.locked ? "" : fi.tonnes || ""} placeholder={lock.locked ? "Impact non validé" : "t / horizon"} onChange={set("tonnes")} />
+          </FField>
+          <FField label="Gain net en €/an">
+            <input type="text" inputMode="decimal" className={inputCls} style={{ borderColor: C.grid, background: lock.locked ? "#F4F5F7" : "#fff" }}
+              disabled={lock.locked} value={lock.locked ? "" : fi.gain || ""} placeholder={lock.locked ? "Impact non validé" : "€/an"} onChange={set("gain")} />
+          </FField>
+          <FField label="Niveau de confiance">{sel("confidence", ["faible", "moyen", "élevé"])}</FField>
+        </div>
+        {lock.locked && <p className="text-xs mt-2" style={{ color: "#9A4A06" }}>Verrou fermé : tonnes récupérables et gain net ne sont saisissables qu'après validation des données et des entrées économiques.</p>}
+      </div>
+    </Card>
+  );
+}
+
+// ---- Cascade d'impact ----
+function Cascade({ F, X, A, Q, lock }) {
+  const need = (keys) => COLLECT_ITEMS.filter((i) => keys.includes(i.key) && !collectState(i, X, A, Q)).map((i) => i.label);
+  const r = F.reference;
+  const fiches = Object.values(X.store.fiches).filter((f) => f.cause === "confirmée" && filled(f.target)).length;
+  const cards = [
+    { n: 1, title: "Référence",
+      formula: "Tonnes bonnes = heures planifiées × disponibilité × cadence brute × rendement qualité",
+      body: <>Retraité, toutes recettes confondues : {nc(r.plannedH, (x) => nf0.format(x) + " h")} × {pctNc(r.availability)} × {nc(r.grossRate, (x) => nf2.format(x) + " t/h")} × {pctNc(r.yield)} = <b>{nc(r.goodT, tons)}</b> bonnes.</>,
+      notes: ["Par recette et sur un horizon commun : recette absente des fichiers.", "Jamais la somme des tonnes mixing + extrusion + packing."],
+      missing: need(["recipeRate", "horizon"]) },
+    { n: 2, title: "Scénario",
+      formula: "Gain incrémental = volume(scénario n) − volume(scénario n−1)",
+      body: <>Ordre explicite : A, puis B (B1, B2, B3 sans chevauchement), puis C, puis D. {fiches} fiche{fiches > 1 ? "s" : ""} avec cause confirmée et cible.</>,
+      notes: ["Ne jamais sommer plusieurs gains calculés chacun depuis la même référence."],
+      missing: fiches === 0 ? ["Cibles validées par famille"] : [] },
+    { n: 3, title: "Gain vendable",
+      formula: "Ventes plafonnées = min(volume, demande servable, capacité aval) ; gain vendable = ventes plafonnées(scénario) − ventes plafonnées(référence)",
+      body: <>Les gains locaux hors goulot ne deviennent pas automatiquement des ventes.</>,
+      notes: ["La famine du conditionnement ne s'ajoute pas au gain extrusion."],
+      missing: need(["demand", "mix", "downstreamCap", "stocks"]) },
+    { n: 4, title: "Gain net",
+      formula: "Gain net = Δ ventes × marge contributive + économies hors marge − coûts du plan",
+      body: <>Pas de double compte matière, rebut, énergie ou coût d'arrêt déjà inclus dans la marge.</>,
+      notes: ["Annualisation seulement avec calendrier et horizon explicites.", "Économies sans ventes supplémentaires : à évaluer à part, sur leurs propres entrées documentées."],
+      missing: need(["margin", "planCosts", "calendar", "horizon"]) },
+  ];
+  return (
+    <Card title="Cascade d'impact" sub="Le raisonnement et les formules ; aucun montant tant que les entrées ne sont pas renseignées et validées.">
+      <div className="grid grid-cols-1 lg:grid-cols-[1fr_auto_1fr_auto_1fr_auto_1fr] gap-2 items-stretch">
+        {cards.map((c, i) => (
+          <React.Fragment key={c.n}>
+            <div className="rounded-lg p-4 flex flex-col gap-2" style={{ border: `1px solid ${C.grid}`, background: "#fff" }}>
+              <div className="flex items-center gap-2">
+                <span className="num font-bold rounded w-7 h-7 flex items-center justify-center text-sm shrink-0" style={{ background: C.navy, color: "#fff" }}>{c.n}</span>
+                <h3 className="font-semibold" style={{ color: C.navy }}>{c.title}</h3>
+              </div>
+              <div className="text-xs p-2 rounded" style={{ background: "#F4F5F7", color: C.ink, fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>{c.formula}</div>
+              <p className="text-sm num">{c.body}</p>
+              <ul className="text-xs space-y-1 list-disc pl-4" style={{ color: C.muted }}>{c.notes.map((x) => <li key={x}>{x}</li>)}</ul>
+              <div className="mt-auto pt-2" style={{ borderTop: `1px solid ${C.grid}` }}>
+                {c.n === 1
+                  ? <Pill tone="info">Référence retraitée, non validée</Pill>
+                  : lock.locked || c.missing.length ? <Pill tone="warn">Impact non validé</Pill> : <Pill tone="ok">Entrées complètes</Pill>}
+                {c.missing.length > 0 && <p className="text-xs mt-1.5" style={{ color: C.muted }}>À collecter : {c.missing.join(", ")}.</p>}
+              </div>
+            </div>
+            {i < cards.length - 1 && <><div className="hidden lg:flex"><Arrow /></div><div className="lg:hidden"><Arrow down /></div></>}
+          </React.Fragment>
+        ))}
+      </div>
+      {!lock.locked && (
+        <p className="text-sm mt-3" style={{ color: C.navy }}>Entrées complètes : le calcul du gain reste à construire et à valider avec le contrôle de gestion. Cette version n'affiche aucun montant.</p>
+      )}
+    </Card>
+  );
+}
+
+// ---- Hypothèses à collecter ----
+function CollectCard({ X, A, Q }) {
+  return (
+    <Card title="Hypothèses à collecter avant le classement économique"
+      sub="Demande et mix, cadence par recette, marge €/t, prix et consommations, calendrier, stocks et encours, coûts des actions, horizon.">
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+        {COLLECT_ITEMS.map((i) => {
+          const ok = collectState(i, X, A, Q);
+          return (
+            <div key={i.key} className="rounded p-3" style={{ border: `1px solid ${C.grid}`, borderLeft: `4px solid ${ok ? C.ok : C.accent}` }}>
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="font-semibold text-sm" style={{ color: C.navy }}>{i.label}{i.required ? "" : " (complément)"}</span>
+                {ok ? <Pill tone="ok">renseigné</Pill> : <Pill tone="warn">à collecter</Pill>}
+              </div>
+              {i.source === "collect"
+                ? <input type="text" className={inputCls + " mt-2"} style={{ borderColor: C.grid }} value={X.store.collect[i.key] || ""} placeholder={i.placeholder}
+                    aria-label={i.label} onChange={(e) => X.setCollect(i.key, e.target.value)} />
+                : <p className="text-xs mt-1" style={{ color: C.muted }}>{i.hint}{i.key === "demand" && ok ? ` Valeur : ${Q.get("capacity").fields.demand} t/mois.` : ""}</p>}
+            </div>
+          );
+        })}
+      </div>
+      <h3 className="font-semibold mt-6" style={{ color: C.navy }}>Encarts terrain existants</h3>
+      <p className="text-sm mb-3" style={{ color: C.muted }}>
+        {A.pending} sur {FIELD_CARDS.length} restent à confirmer. Priorité : valeur terrain, puis hypothèse réglée, puis défaut.
+        La marge par défaut de {nf0.format(PARAMS.margin.def)} €/t reste une hypothèse de démonstration non validée.
+      </p>
+      <div key={A.resetKey} className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+        {FIELD_CARDS.map((c) => <FieldCard key={c.key} card={c} A={A} />)}
+      </div>
+      <details className="mt-5">
+        <summary className="cursor-pointer text-sm font-semibold" style={{ color: C.navy }}>Hypothèses de démonstration utilisées par les autres onglets (non validées)</summary>
+        <p className="text-sm mt-2 mb-3" style={{ color: C.muted }}>
+          Ces curseurs alimentent les montants indicatifs de « Vue d'ensemble », « Lignes » et « Flow ». Ils ne déverrouillent pas les impacts de cet onglet.
+        </p>
+        <div className="max-w-xl"><AssumptionsPanel A={A} /></div>
+      </details>
+    </Card>
+  );
+}
+
+// ---- Aide repliable : arbre usine entière ----
+function MeceTree({ F }) {
+  const box = (title, text, accent) => (
+    <div className="rounded-lg p-3 h-full" style={{ border: `${accent ? 2 : 1}px solid ${accent ? C.accent : C.grid}`, background: accent ? "#FFF6EE" : "#fff" }}>
+      <div className="font-semibold text-sm" style={{ color: C.navy }}>{title}</div>
+      <div className="text-xs mt-1" style={{ color: C.ink }}>{text}</div>
+    </div>
+  );
+  const st = Object.fromEntries(F.stages.map((s) => [s.stage, s]));
+  const stageTxt = {
+    mixing: `Bloqué ${pctNc(st.mixing && st.mixing.blockedPct)} par l'aval.`,
+    extrusion: `Bloquée ${pctNc(st.extrusion && st.extrusion.blockedPct)}, sans alimentation ${pctNc(st.extrusion && st.extrusion.starvedPct)}.`,
+    packing: `Sans alimentation ${pctNc(st.packing && st.packing.starvedPct)}.`,
+  };
+  return (
+    <section className="card p-5">
+      <details>
+        <summary className="cursor-pointer text-lg font-semibold" style={{ color: C.navy }}>Comprendre l'arbre MECE</summary>
+        <div className="mt-4 space-y-2">
+          {box("Résultat simplifié", "Tonnes vendues × marge contributive moyenne − charges fixes.")}
+          <Arrow down />
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+            {box("Tonnes vendues", "Production bonne + stock initial − stock final, plafonnées par la demande servable.")}
+            {box("Marge par tonne", "Prix net − coût variable.")}
+            {box("Charges fixes", "Coûts qui ne varient pas avec le volume à l'horizon retenu.")}
+          </div>
+          <Arrow down />
+          <div className="rounded-lg p-3" style={{ background: "#F4F5F7" }}>
+            <div className="font-semibold text-sm" style={{ color: C.navy }}>Production bonne, pour chaque étape</div>
+            <div className="grid grid-cols-1 md:grid-cols-[1fr_auto_1fr_auto_1fr] gap-2 mt-2">
+              {F.stages.map((s, i) => (
+                <React.Fragment key={s.stage}>
+                  {box(`${STAGE_FR[s.stage]}${s.stage === F.bottleneck ? " · goulot probable" : ""}`, stageTxt[s.stage], s.stage === F.bottleneck)}
+                  {i < F.stages.length - 1 && <><div className="hidden md:flex"><Arrow /></div><div className="md:hidden"><Arrow down /></div></>}
+                </React.Fragment>
+              ))}
+            </div>
+            <div className="flex flex-wrap gap-1.5 mt-3">
+              {["A temps ouvert", "B disponibilité (B1 pannes, B2 changements, B3 autres arrêts)", "C cadence", "D qualité"].map((x) => <Pill key={x} tone="info">{x}</Pill>)}
+            </div>
+            <p className="text-xs mt-2" style={{ color: C.muted }}>Indicateurs de flux calculés depuis stage_daily. Ils localisent une contrainte ; ils ne prouvent ni sa cause ni un besoin d'investissement.</p>
+          </div>
+          <Arrow down />
+          <div className="rounded-lg p-3" style={{ border: `1px solid ${C.grid}` }}>
+            <div className="font-semibold text-sm" style={{ color: C.navy }}>Causes à tester</div>
+            <div className="flex flex-wrap gap-1.5 mt-2">{["Matière", "Machine", "Méthode", "Personnel", "Environnement"].map((x) => <Pill key={x} tone="mute">{x}</Pill>)}</div>
+            <p className="text-xs mt-2" style={{ color: C.muted }}>Rien n'est confirmé à ce stade : ni « M04 = problème machine », ni « pas de problème de compétences ».</p>
+          </div>
+          <p className="text-xs" style={{ color: C.muted }}>Cadre simplifié : production propre, sans négoce ni effets comptables de valorisation des stocks.</p>
+        </div>
+      </details>
+    </section>
+  );
+}
+
+function Problems({ M, A, Q }) {
+  const X = useMece();
+  const F = useMemo(() => K.meceFacts(M.rows, M.stageRows), [M]);
+  const fams = meceFamilies(F, M.control, A);
+  const lock = lockState(X, A, Q);
+  return (
+    <div className="space-y-5">
+      <div>
+        <h2 className="text-2xl font-semibold" style={{ color: C.navy }}>Problèmes & impact : du constat au gain</h2>
+        <p className="text-sm mt-1" style={{ color: C.muted }}>Ordre de lecture : contrôle des données, familles de pertes, carte standard, cascade d'impact, hypothèses à collecter.</p>
+      </div>
+      <DataControlCard M={M} X={X} lock={lock} />
+      <MeceTable fams={fams} />
+      <StandardCard fams={fams} X={X} Q={Q} M={M} lock={lock} />
+      <Cascade F={F} X={X} A={A} Q={Q} lock={lock} />
+      <CollectCard X={X} A={A} Q={Q} />
+      <MeceTree F={F} />
     </div>
   );
 }
@@ -1271,7 +1839,7 @@ function App() {
         {tab === "overview" && <Overview M={M} E={E} go={setTab} />}
         {tab === "lines" && <Lines_ M={M} E={E} />}
         {tab === "flow" && <Flow M={M} E={E} />}
-        {tab === "problems" && <Problems M={M} E={E} A={A} />}
+        {tab === "problems" && <Problems M={M} A={A} Q={Q} />}
         {tab === "questions" && <Questions M={M} Q={Q} />}
       </main>
       <footer className="max-w-[1400px] mx-auto px-4 sm:px-6 pb-8 text-xs" style={{ color: C.muted }}>
