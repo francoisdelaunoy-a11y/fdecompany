@@ -127,8 +127,69 @@
     return { stages: stages, bottleneck: bottleneck ? bottleneck.stage : null };
   }
 
+  // Impact économique des quatre problèmes, sur la période puis annualisé.
+  // p : { margin €/t, downtimeCost €/h, smedPct, worstDownPct, bottleneckPct, scrapTarget (fractions 0-1) }.
+  // Une minute perdue en extrusion vaut le débit réel de tonnes bonnes par heure de marche
+  // (= cadence nominale × performance × qualité), de la ligne ou de l'usine.
+  function impacts(rows, stageRows, p) {
+    var plant = oee(rows);
+    var days = Object.keys(groupBy(rows, function (r) { return r.date; })).length;
+    var annual = safeDiv(365, days) || 0;
+    var goodRate = function (o) { return safeDiv(o.good, o.run / 60) || 0; };
+    var rate = goodRate(plant);
+    var tOf = function (min, r) { return min / 60 * r; };
+
+    var lines = Object.keys(groupBy(rows, function (r) { return r.machine; })).sort().map(function (m) {
+      var o = oee(rows.filter(function (r) { return r.machine === m; }));
+      o.machine = m; o.rate = goodRate(o); return o;
+    });
+    var worst = lines.reduce(function (a, b) { return b.down > a.down ? b : a; }, lines[0] || null);
+    var others = lines.filter(function (l) { return l !== worst; });
+    var othersAvgDown = safeDiv(others.reduce(function (s, l) { return s + l.down; }, 0), others.length) || 0;
+
+    // 1. Pannes : toutes lignes ; levier = maintenance ciblée sur la pire ligne.
+    var downT = tOf(plant.down, rate);
+    var wRate = worst && worst.rate > 0 ? worst.rate : rate;
+    var downGainMin = worst ? worst.down * p.worstDownPct : 0;
+    var downGainT = tOf(downGainMin, wRate);
+    var down = { id: "downtime", minutes: plant.down, tonnes: downT,
+      cost: downT * p.margin + plant.down / 60 * p.downtimeCost,
+      worst: worst, othersAvgDown: othersAvgDown, alignPct: worst && worst.down > 0 ? Math.max(0, 1 - othersAvgDown / worst.down) : 0,
+      gainMin: downGainMin, gainT: downGainT * annual,
+      gainEur: (downGainT * p.margin + downGainMin / 60 * p.downtimeCost) * annual };
+
+    // 2. Changements de série : levier SMED (réduction du temps de changement).
+    var coT = tOf(plant.coMin, rate);
+    var co = { id: "changeover", minutes: plant.coMin, count: plant.co, tonnes: coT, cost: coT * p.margin,
+      avgMin: safeDiv(plant.coMin, plant.co),
+      gainMin: plant.coMin * p.smedPct, gainT: coT * p.smedPct * annual, gainEur: coT * p.smedPct * p.margin * annual };
+
+    // 3. Rebut : levier plan qualité (ramener le taux de rebut à la cible).
+    var scrapRate = plant.scrapRate || 0;
+    var scrapGainT = Math.max(0, plant.output * (scrapRate - p.scrapTarget));
+    var scrap = { id: "scrap", tonnes: plant.scrap, rate: scrapRate, output: plant.output, cost: plant.scrap * p.margin,
+      gainT: scrapGainT * annual, gainEur: scrapGainT * p.margin * annual };
+
+    // 4. Goulot : capacité amont bloquée par le goulot, valorisée au débit de l'étape amont.
+    var f = flow(stageRows), idx = STAGES.indexOf(f.bottleneck);
+    var src = idx > 0 ? f.stages[idx - 1] : f.stages[idx + 1];
+    var lostMin = src ? (idx > 0 ? src.blocked : src.starved) : 0;
+    var srcRun = src ? src.planned - src.starved - src.blocked : 0;
+    var srcRate = src ? safeDiv(src.output, srcRun) || 0 : 0; // t par minute-unité de marche
+    var bnT = lostMin * srcRate;
+    var bn = { id: "bottleneck", stage: f.bottleneck, source: src ? src.stage : null, sourceKind: idx > 0 ? "blocked" : "starved",
+      minutes: lostMin, ratePerUnitHour: srcRate * 60, tonnes: bnT, cost: bnT * p.margin,
+      gainT: bnT * p.bottleneckPct * annual, gainEur: bnT * p.bottleneckPct * p.margin * annual };
+
+    var problems = [bn, down, co, scrap].sort(function (a, b) { return b.cost - a.cost; });
+    return { days: days, annual: annual, rate: rate, plant: plant, problems: problems,
+      // Le goulot recoupe pannes et changements (ce sont eux qui limitent l'extrusion) : il n'est pas additionné.
+      internalGainEur: down.gainEur + co.gainEur + scrap.gainEur,
+      internalGainT: down.gainT + co.gainT + scrap.gainT };
+  }
+
   root.PolymexKPI = { safeDiv: safeDiv, parseCSV: parseCSV, cleanShiftLog: cleanShiftLog, missingShifts: missingShifts,
-    oee: oee, groupBy: groupBy, weekStart: weekStart, flow: flow, STAGES: STAGES };
+    oee: oee, groupBy: groupBy, weekStart: weekStart, flow: flow, impacts: impacts, STAGES: STAGES };
 })(typeof window !== "undefined" ? window : globalThis);
 </script>
 
@@ -138,10 +199,12 @@ const K = window.PolymexKPI;
 
 const C = { navy: "#172B4D", navy2: "#2D4A7A", navy3: "#8FA3C4", accent: "#E8710A", ok: "#1F7A4D", muted: "#5E6C84", grid: "#E6E9EF" };
 const STAGE_FR = { mixing: "Mélange", extrusion: "Extrusion", packing: "Conditionnement" };
+const STAGE_THE = { mixing: "Le mélange", extrusion: "L'extrusion", packing: "Le conditionnement" };
 const MONTHS = ["janv.", "févr.", "mars", "avr.", "mai", "juin", "juil.", "août", "sept.", "oct.", "nov.", "déc."];
 
 const nf1 = new Intl.NumberFormat("fr-FR", { minimumFractionDigits: 1, maximumFractionDigits: 1 });
 const nf0 = new Intl.NumberFormat("fr-FR", { maximumFractionDigits: 0 });
+const nf2 = new Intl.NumberFormat("fr-FR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const pct = (v) => (v === null || v === undefined ? "—" : nf1.format(v * 100) + " %");
 const tons = (v) => (v === null || v === undefined ? "—" : nf1.format(v) + " t");
 const mins = (v) => (v === null || v === undefined ? "—" : nf0.format(v) + " min");
@@ -178,7 +241,8 @@ function buildModel(shiftRaw, stageRaw) {
     });
 
   return {
-    clean, rows, dates, plant, machines, shifts,
+    clean, rows, dates, plant, machines, shifts, stageRows: stageClean,
+    idealPlannedT: rows.reduce((s, r) => s + r.planned_min / 60 * r.ideal_rate_tph, 0),
     weeks: weekly(rows), weeklyOf: (m) => weekly(rows.filter((r) => r.machine === m)),
     missing: K.missingShifts(rows), flow, stageWeekly,
     stageOutput: Object.fromEntries(flow.stages.map((s) => [s.stage, s.output])),
@@ -350,7 +414,7 @@ const fmtT = { axis: (v) => nf0.format(v) + " t", tip: tons };
 const fmtN = { axis: (v) => nf0.format(v), tip: (v) => nf0.format(v) };
 
 // ---------- Onglet 1 : vue d'ensemble ----------
-function Overview({ M }) {
+function Overview({ M, E, go }) {
   const ranked = [...M.machines].sort((a, b) => b.oee - a.oee);
   const worst = ranked[ranked.length - 1];
   const maxOee = Math.max(...ranked.map((m) => m.oee));
@@ -364,6 +428,17 @@ function Overview({ M }) {
         <Kpi label="Arrêts non planifiés" value={mins(M.plant.down)} alert
           note={`${hours(M.plant.down)} de pannes · ${pct(K.safeDiv(M.plant.down, M.plant.planned))} du temps planifié`} />
       </div>
+
+      <section className="card p-4 flex flex-wrap items-center justify-between gap-3" style={{ borderLeft: `4px solid ${C.ok}` }}>
+        <p className="text-base">
+          <b style={{ color: C.navy }}>Potentiel identifié : {eur(E.impacts.internalGainEur)}/an</b> avec trois leviers (SMED, maintenance ciblée, plan qualité),
+          et jusqu'à {eur(E.impacts.problems.find((p) => p.id === "bottleneck").gainEur)}/an en ajoutant de la capacité au goulot.
+          <span style={{ color: C.muted }}> Marge retenue : {nf0.format(E.values.margin)} €/t.</span>
+        </p>
+        <button onClick={() => go("problems")} className="text-sm font-semibold px-3 py-1.5 rounded" style={{ background: C.navy, color: "#fff" }}>
+          Voir les problèmes et leviers →
+        </button>
+      </section>
 
       <div className="grid grid-cols-1 xl:grid-cols-5 gap-5">
         <Card className="xl:col-span-3" title="Tendance hebdomadaire" sub={`Production brute (t) et TRS par semaine, du lundi au dimanche. Semaines partielles : ${M.weeks.filter((w) => w.days < 7).map((w) => `${dShort(w.week)} (${w.days} j)`).join(", ")}.`}>
@@ -399,7 +474,7 @@ function Overview({ M }) {
 }
 
 // ---------- Onglet 2 : lignes ----------
-function Lines_({ M }) {
+function Lines_({ M, E }) {
   const [sel, setSel] = useState("M07");
   const m = M.machines.find((x) => x.machine === sel);
   const wk = useMemo(() => M.weeklyOf(sel), [sel, M]);
@@ -494,6 +569,11 @@ function Lines_({ M }) {
             <div className="text-sm pt-2" style={{ color: C.muted, borderTop: `1px solid ${C.grid}` }}>
               {nf0.format(m.co)} changements de série, soit {mins(K.safeDiv(m.coMin, m.co))} en moyenne chacun.
               Production : {tons(m.output)}, dont {tons(m.good)} bonnes.
+              {(() => {
+                const rate = K.safeDiv(m.good, m.run / 60) || 0, lostT = (m.coMin + m.down + m.other) / 60 * rate;
+                const year = E.impacts.annual * (lostT * E.values.margin + m.down / 60 * E.values.downtimeCost);
+                return <> Ces arrêts représentent ≈ {tons(lostT)} bonnes non produites, soit <b style={{ color: C.navy }}>{eur(year)}/an</b> (marge + coût direct des pannes).</>;
+              })()}
             </div>
           </div>
         </Card>
@@ -541,7 +621,7 @@ function Lines_({ M }) {
 }
 
 // ---------- Onglet 3 : flow ----------
-function Flow({ M }) {
+function Flow({ M, E }) {
   const { stages, bottleneck } = M.flow;
   const ext = stages.find((s) => s.stage === "extrusion");
   const mix = stages.find((s) => s.stage === "mixing");
@@ -583,7 +663,8 @@ function Flow({ M }) {
             Le mélange est bloqué {pct(mix.blockedPct)} du temps parce que l'extrusion n'absorbe pas son débit,
             et le conditionnement attend l'extrusion {pct(pack.starvedPct)} du temps. L'extrusion, elle, n'est presque jamais
             à l'arrêt pour cause de flux ({pct(ext.idlePct)}) : c'est elle qui fixe la cadence de l'usine.
-            Chaque point de TRS gagné en extrusion (aujourd'hui {pct(M.plant.oee)}) se retrouve directement en tonnes livrées.
+            Chaque point de TRS gagné en extrusion (aujourd'hui {pct(M.plant.oee)}) vaut ≈ {tons(M.idealPlannedT * 0.01 * E.impacts.annual)} bonnes par an,
+            soit <b style={{ color: C.navy }}>{eur(M.idealPlannedT * 0.01 * E.impacts.annual * E.values.margin)}/an</b> de marge.
           </p>
         </div>
       </Card>
@@ -620,6 +701,267 @@ function Flow({ M }) {
   );
 }
 
+// ---------- Hypothèses économiques ----------
+// Les pourcentages sont saisis en % dans l'interface et convertis en fractions pour kpi-lib.
+// Prix de vente par défaut : chiffre d'affaires et tonnage annuels du brief (README).
+const BRIEF_REVENUE_EUR = 148e6, BRIEF_TONNES = 86000;
+const PARAMS = {
+  margin: { label: "Marge sur coûts variables", unit: "€/t", def: 300, min: 0, max: 1000, step: 10 },
+  downtimeCost: { label: "Coût direct d'une heure d'arrêt non planifié", unit: "€/h", def: 250, min: 0, max: 2000, step: 10,
+    hint: "Hors marge perdue : intervention, pièces, main d'œuvre immobilisée." },
+  smedPct: { label: "SMED : réduction du temps de changement", unit: "%", def: 30, min: 0, max: 80, step: 5, pct: true },
+  worstDownPct: { label: "Maintenance : réduction des pannes de la pire ligne", unit: "%", def: 50, min: 0, max: 90, step: 5, pct: true },
+  bottleneckPct: { label: "Capacité : part du blocage amont récupérée", unit: "%", def: 50, min: 0, max: 100, step: 5, pct: true },
+  scrapTarget: { label: "Taux de rebut cible", unit: "%", def: 4, min: 0, max: 10, step: 0.5, pct: true },
+  price: { label: "Prix de vente moyen", unit: "€/t", def: Math.round(BRIEF_REVENUE_EUR / BRIEF_TONNES),
+    hint: "Défaut : 148 M€ de CA / 86 000 t par an (brief)." },
+  operators: { label: "Opérateurs par ligne et par équipe", unit: "pers.", def: 2 },
+  energyPrice: { label: "Coût de l'électricité", unit: "€/MWh", def: 150 },
+  energyKwhT: { label: "Consommation électrique de l'extrusion", unit: "kWh/t", def: 350 },
+};
+const HYP_KEYS = ["margin", "downtimeCost", "smedPct", "worstDownPct", "bottleneckPct", "scrapTarget"];
+const FIELD_CARDS = [
+  { key: "margin", title: "Vraie marge par tonne", who: "Contrôle de gestion" },
+  { key: "price", title: "Prix de vente moyen", who: "Direction commerciale" },
+  { key: "downtimeCost", title: "Coût d'une heure de panne", who: "Responsable maintenance" },
+  { key: "scrapTarget", title: "Taux de rebut cible", who: "Responsable qualité" },
+  { key: "operators", title: "Effectifs en extrusion", who: "Responsable production" },
+  { key: "energyPrice", title: "Prix de l'électricité", who: "Achats / services généraux" },
+  { key: "energyKwhT", title: "Consommation par tonne", who: "Méthodes / énergie" },
+];
+const STORE_KEY = "polymex-cockpit-assumptions-v1";
+
+function loadStore() {
+  try {
+    const s = JSON.parse(localStorage.getItem(STORE_KEY) || "null");
+    if (s && typeof s === "object") return { hyp: s.hyp || {}, field: s.field || {} };
+  } catch (e) { /* stockage indisponible : on repart des valeurs par défaut */ }
+  return { hyp: {}, field: {} };
+}
+
+// Valeur effective : saisie terrain > hypothèse réglée > défaut.
+function useAssumptions() {
+  const [store, setStore] = useState(loadStore);
+  const [resetKey, setResetKey] = useState(0);
+  useEffect(() => { try { localStorage.setItem(STORE_KEY, JSON.stringify(store)); } catch (e) { /* ignoré */ } }, [store]);
+  const values = {};
+  Object.keys(PARAMS).forEach((k) => { values[k] = store.field[k] ?? store.hyp[k] ?? PARAMS[k].def; });
+  const lib = {};
+  Object.keys(PARAMS).forEach((k) => { lib[k] = PARAMS[k].pct ? values[k] / 100 : values[k]; });
+  return {
+    values, lib, store, resetKey,
+    pending: FIELD_CARDS.filter((c) => store.field[c.key] === undefined).length,
+    confirmed: (k) => store.field[k] !== undefined,
+    setHyp: (k, v) => setStore((s) => ({ ...s, hyp: { ...s.hyp, [k]: v } })),
+    setField: (k, v) => setStore((s) => {
+      const field = { ...s.field };
+      if (v === undefined) delete field[k]; else field[k] = v;
+      return { ...s, field };
+    }),
+    reset: () => { setStore({ hyp: {}, field: {} }); setResetKey((n) => n + 1); },
+  };
+}
+
+const eur = (v) => {
+  if (v === null || v === undefined || !Number.isFinite(v)) return "—";
+  const a = Math.abs(v);
+  if (a >= 1e6) return nf1.format(v / 1e6) + " M€";
+  if (a >= 1e4) return nf0.format(v / 1e3) + " k€";
+  return nf0.format(v) + " €";
+};
+const fmtParam = (k, v) => (PARAMS[k].pct ? nf1.format(v) : nf0.format(v)) + " " + PARAMS[k].unit;
+
+function Badge({ ok }) {
+  return ok
+    ? <span className="text-xs font-semibold px-2 py-0.5 rounded" style={{ background: "#E6F2EC", color: C.ok }}>Valeur terrain</span>
+    : <span className="text-xs font-semibold px-2 py-0.5 rounded whitespace-nowrap" style={{ background: "#FDEBDD", color: "#9A4A06" }}>à confirmer avec l'usine</span>;
+}
+
+function AssumptionsPanel({ A }) {
+  return (
+    <section className="card p-5 xl:sticky xl:top-4">
+      <h2 className="text-lg font-semibold" style={{ color: C.navy }}>Hypothèses de calcul</h2>
+      <p className="text-sm mt-0.5 mb-4" style={{ color: C.muted }}>Tous les montants en € du cockpit se recalculent à chaque réglage.</p>
+      <div className="space-y-5">
+        {HYP_KEYS.map((k) => {
+          const p = PARAMS[k], locked = A.confirmed(k);
+          return (
+            <div key={k}>
+              <div className="flex justify-between items-baseline gap-2">
+                <label htmlFor={`hyp-${k}`} className="text-sm font-medium">{p.label}</label>
+                <span className="num font-semibold whitespace-nowrap" style={{ color: C.navy }}>{fmtParam(k, A.values[k])}</span>
+              </div>
+              <input id={`hyp-${k}`} type="range" className="w-full mt-1" style={{ accentColor: C.navy }}
+                min={p.min} max={Math.max(p.max, A.values[k])} step={p.step} value={A.values[k]} disabled={locked}
+                onChange={(e) => A.setHyp(k, Number(e.target.value))} />
+              {locked
+                ? <div className="text-xs" style={{ color: C.ok }}>Remplacé par la valeur terrain saisie plus bas.</div>
+                : p.hint && <div className="text-xs" style={{ color: C.muted }}>{p.hint}</div>}
+            </div>
+          );
+        })}
+      </div>
+      <div className="mt-5 pt-4 flex items-center justify-between gap-3" style={{ borderTop: `1px solid ${C.grid}` }}>
+        <span className="text-xs" style={{ color: C.muted }}>Valeurs enregistrées dans ce navigateur.</span>
+        <button className="text-sm font-semibold px-3 py-1.5 rounded border" style={{ color: C.navy, borderColor: C.grid }}
+          onClick={() => { if (window.confirm("Réinitialiser toutes les hypothèses et valeurs terrain ?")) A.reset(); }}>
+          Réinitialiser les valeurs
+        </button>
+      </div>
+    </section>
+  );
+}
+
+function FieldCard({ card, A }) {
+  const p = PARAMS[card.key], saved = A.store.field[card.key];
+  const [draft, setDraft] = useState(saved === undefined ? "" : String(saved).replace(".", ","));
+  const [invalid, setInvalid] = useState(false);
+  const onChange = (e) => {
+    const raw = e.target.value;
+    setDraft(raw);
+    if (raw.trim() === "") { setInvalid(false); A.setField(card.key, undefined); return; }
+    const n = Number(raw.replace(/\s/g, "").replace(",", "."));
+    if (Number.isFinite(n) && n >= 0) { setInvalid(false); A.setField(card.key, n); } else setInvalid(true);
+  };
+  return (
+    <div className="card p-4 flex flex-col gap-2" style={{ borderTop: `3px solid ${saved === undefined ? C.accent : C.ok}` }}>
+      <div className="flex justify-between items-start gap-2">
+        <span className="font-semibold" style={{ color: C.navy }}>{card.title}</span>
+        {saved === undefined ? <Badge ok={false} /> : null}
+      </div>
+      <div className="text-xs" style={{ color: C.muted }}>À demander : {card.who}</div>
+      <div className="flex items-center rounded border" style={{ borderColor: invalid ? C.accent : C.grid }}>
+        <input type="text" inputMode="decimal" className="num w-full px-3 py-2 text-lg outline-none rounded" placeholder={nf0.format(p.def)}
+          value={draft} onChange={onChange} aria-label={card.title} />
+        <span className="px-3 text-sm" style={{ color: C.muted }}>{p.unit}</span>
+      </div>
+      <div className="text-xs" style={{ color: invalid ? C.accent : C.muted }}>
+        {invalid ? "Nombre positif attendu." : saved === undefined ? `Valeur par défaut utilisée : ${fmtParam(card.key, p.def)}` : `Utilisée partout dans le cockpit.`}
+      </div>
+    </div>
+  );
+}
+
+// ---------- Onglet 4 : problèmes et impact ----------
+function ProblemCard({ rank, pb, E, M, maxCost }) {
+  const v = E.values, I = E.impacts, rate = nf2.format(I.rate);
+  let title, detail, method, lever, leverText, extra = null, note = null;
+  if (pb.id === "bottleneck") {
+    const srcPct = K.safeDiv(pb.minutes, M.flow.stages.find((s) => s.stage === pb.source)?.planned || 0);
+    title = `Goulot du flux : ${pb.stage ? STAGE_FR[pb.stage].toLowerCase() : "non identifié"}`;
+    detail = pb.sourceKind === "blocked"
+      ? `${STAGE_THE[pb.source] || "L'amont"} est bloqué ${pct(srcPct)} de son temps faute de place en ${STAGE_FR[pb.stage]?.toLowerCase()} : capacité amont disponible mais non transformée.`
+      : `${STAGE_THE[pb.source] || "L'aval"} attend ${pct(srcPct)} de son temps.`;
+    method = `${nf0.format(pb.minutes)} min-unités de blocage (${(STAGE_FR[pb.source] || "").toLowerCase()}) ÷ 60 × ${nf2.format(pb.ratePerUnitHour)} t/h par unité en marche = ${tons(pb.tonnes)}`;
+    lever = "Capacité au goulot";
+    leverText = `Ajouter de la capacité d'extrusion (heures, débridage, 8e ligne) pour absorber ${nf0.format(v.bottleneckPct)} % du blocage amont. Gain à comparer au coût de l'investissement.`;
+    note = "Recoupe les pannes et les changements de série, qui limitent eux-mêmes l'extrusion : non additionné au total.";
+  } else if (pb.id === "downtime") {
+    const w = pb.worst;
+    title = "Pannes (arrêts non planifiés)";
+    detail = w ? `${w.machine} cumule ${mins(w.down)} de pannes, ${nf1.format(K.safeDiv(w.down, pb.othersAvgDown) || 0)} fois la moyenne des autres lignes (${mins(pb.othersAvgDown)}). Soit ${nf0.format(pb.minutes / 60 * v.operators)} heures-opérateur immobilisées sur l'usine.` : "";
+    method = `${nf0.format(pb.minutes)} min ÷ 60 × ${rate} t bonnes/h = ${tons(pb.tonnes)} ; coût = t × ${nf0.format(v.margin)} €/t + ${nf0.format(pb.minutes / 60)} h × ${nf0.format(v.downtimeCost)} €/h`;
+    lever = `Maintenance ciblée sur ${w ? w.machine : "la pire ligne"}`;
+    leverText = `Réduire de ${nf0.format(v.worstDownPct)} % les pannes de ${w ? w.machine : "la pire ligne"} (l'aligner sur la moyenne des autres lignes = −${nf0.format(pb.alignPct * 100)} %) : analyse des causes, préventif, pièces critiques.`;
+    const max = Math.max(...M.machines.map((m) => m.down));
+    extra = (
+      <div className="grid grid-cols-7 gap-2 mt-3 items-end" style={{ height: 70 }}>
+        {M.machines.map((m) => (
+          <div key={m.machine} className="flex flex-col items-center justify-end h-full" title={`${m.machine} : ${mins(m.down)}`}>
+            <div className="w-full rounded-sm" style={{ height: `${(K.safeDiv(m.down, max) || 0) * 48}px`, background: w && m.machine === w.machine ? C.accent : C.navy3 }} />
+            <span className="text-xs mt-1" style={{ color: w && m.machine === w.machine ? C.accent : C.muted, fontWeight: w && m.machine === w.machine ? 700 : 400 }}>{m.machine}</span>
+          </div>
+        ))}
+      </div>
+    );
+  } else if (pb.id === "changeover") {
+    title = "Temps perdu en changements de série";
+    detail = `${nf0.format(pb.count)} changements, ${mins(pb.avgMin)} en moyenne chacun, soit ${pct(M.plant.coShare)} du temps planifié.`;
+    method = `${nf0.format(pb.minutes)} min ÷ 60 × ${rate} t bonnes/h = ${tons(pb.tonnes)}`;
+    lever = "SMED";
+    leverText = `Réduire de ${nf0.format(v.smedPct)} % la durée des changements : préparation hors arrêt, purges standardisées, séquençage des recettes.`;
+  } else {
+    const mwh = pb.tonnes * v.energyKwhT / 1000;
+    title = "Rebut et retraitement";
+    detail = `${pct(pb.rate)} de la production brute. Énergie consommée par le rebut : ${nf0.format(mwh)} MWh, soit ${eur(mwh * v.energyPrice)} sur la période.`;
+    method = `Σ scrap_t = ${tons(pb.tonnes)} (rebut + retraité), valorisé à la marge`;
+    lever = "Plan qualité";
+    leverText = `Ramener le taux de rebut de ${pct(pb.rate)} à ${nf1.format(v.scrapTarget)} % : réglages au démarrage, contrôle matière, suivi par équipe.`;
+    if (pb.gainT === 0) note = "Le taux actuel est déjà sous la cible : aucun gain avec cette hypothèse.";
+  }
+  return (
+    <section className="card p-5">
+      <div className="flex items-start justify-between gap-4">
+        <div className="flex items-start gap-3 flex-1 min-w-0">
+          <span className="num text-lg font-bold rounded w-9 h-9 flex items-center justify-center shrink-0"
+            style={{ background: rank === 1 ? C.accent : C.navy, color: "#fff" }}>{rank}</span>
+          <div>
+            <h3 className="text-lg font-semibold" style={{ color: C.navy }}>{title}</h3>
+            <p className="text-sm mt-0.5" style={{ color: C.ink }}>{detail}</p>
+          </div>
+        </div>
+        <div className="text-right shrink-0">
+          <div className="num text-3xl font-semibold whitespace-nowrap" style={{ color: C.navy }}>{tons(pb.tonnes)}</div>
+          <div className="text-xs" style={{ color: C.muted }}>perdues sur {I.days} jours</div>
+        </div>
+      </div>
+      <div className="mt-3"><HBar v={pb.cost} max={maxCost} color={rank === 1 ? C.accent : C.navy} h={8} /></div>
+      <div className="num flex flex-wrap gap-x-6 gap-y-1 mt-2 text-sm">
+        <span>Coût sur la période : <b>{eur(pb.cost)}</b></span>
+        <span>Annualisé : <b>{eur(pb.cost * I.annual)}/an</b></span>
+        <span style={{ color: C.muted }}>CA non réalisé : {eur(pb.tonnes * v.price)}</span>
+      </div>
+      <div className="num text-xs mt-2 px-3 py-2 rounded" style={{ background: "#F4F5F7", color: C.muted, fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>
+        Méthode : {method}
+      </div>
+      {extra}
+      <div className="mt-4 p-4 rounded flex flex-wrap justify-between gap-4" style={{ border: `1px solid ${C.grid}`, borderLeft: `4px solid ${C.ok}` }}>
+        <div className="flex-1 min-w-[240px]">
+          <div className="text-xs font-bold uppercase tracking-wide" style={{ color: C.ok }}>Levier : {lever}</div>
+          <p className="text-sm mt-1">{leverText}</p>
+        </div>
+        <div className="text-right">
+          <div className="num text-2xl font-semibold" style={{ color: C.ok }}>+{eur(pb.gainEur)}/an</div>
+          <div className="num text-xs" style={{ color: C.muted }}>+{tons(pb.gainT)} bonnes par an</div>
+        </div>
+      </div>
+      {note && <p className="text-xs mt-2" style={{ color: C.muted }}>{note}</p>}
+    </section>
+  );
+}
+
+function Problems({ M, E, A }) {
+  const I = E.impacts, maxCost = Math.max(...I.problems.map((p) => p.cost), 0);
+  const bn = I.problems.find((p) => p.id === "bottleneck");
+  return (
+    <div className="space-y-5">
+      <div className="grid grid-cols-1 xl:grid-cols-3 gap-5 items-start">
+        <div className="xl:col-span-2 space-y-5">
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+            <Kpi label="Gain des 3 leviers internes" value={`${eur(I.internalGainEur)}/an`} note={`+${tons(I.internalGainT)} bonnes par an (SMED, maintenance, qualité)`} />
+            <Kpi label="Plafond capacité goulot" value={`${eur(bn.gainEur)}/an`} alert note="Non additif : recoupe pannes et changements" />
+            <Kpi label="Marge retenue" value={`${nf0.format(E.values.margin)} €/t`}
+              note={A.confirmed("margin") ? "Valeur terrain" : "Hypothèse, à confirmer avec l'usine"} />
+          </div>
+          <p className="text-sm" style={{ color: C.muted }}>
+            Problèmes classés du plus coûteux au moins coûteux sur la période. Tonnes perdues = tonnes bonnes non produites,
+            au débit réel de l'extrusion ({nf2.format(I.rate)} t bonnes par heure de marche et par ligne). Annualisation × 365 / {I.days} jours.
+            L'extrusion étant le goulot, chaque tonne qu'elle gagne est supposée vendue : à confirmer avec la direction commerciale.
+          </p>
+          {I.problems.map((pb, i) => <ProblemCard key={pb.id} rank={i + 1} pb={pb} E={E} M={M} maxCost={maxCost} />)}
+        </div>
+        <AssumptionsPanel A={A} />
+      </div>
+
+      <Card title="À collecter sur le terrain" sub={`Données à demander aux équipes de l'usine. ${A.pending} sur ${FIELD_CARDS.length} restent à confirmer ; tant qu'un encart est vide, la valeur par défaut est utilisée.`}>
+        <div key={A.resetKey} className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+          {FIELD_CARDS.map((c) => <FieldCard key={c.key} card={c} A={A} />)}
+        </div>
+      </Card>
+    </div>
+  );
+}
+
 // ---------- Notes sur les données ----------
 function DataNotes({ M }) {
   const c = M.clean;
@@ -640,11 +982,15 @@ function DataNotes({ M }) {
 }
 
 // ---------- Application ----------
-const TABS = [["overview", "Vue d'ensemble"], ["lines", "Lignes"], ["flow", "Flow"]];
+const TABS = [["overview", "Vue d'ensemble"], ["lines", "Lignes"], ["flow", "Flow"], ["problems", "Problèmes & impact"]];
 
 function App() {
   const [state, setState] = useState({ status: "loading" });
   const [tab, setTab] = useState("overview");
+  const A = useAssumptions();
+  const M0 = state.M;
+  const E = useMemo(() => (M0 ? { values: A.values, impacts: K.impacts(M0.rows, M0.stageRows, A.lib) } : null),
+    [M0, JSON.stringify(A.lib)]);
   useEffect(() => {
     Promise.all(["./extrusion_shift_log.csv", "./stage_daily.csv"].map((u) =>
       fetch(u).then((r) => { if (!r.ok) throw new Error(`${u} : HTTP ${r.status}`); return r.text(); })))
@@ -669,7 +1015,11 @@ function App() {
             <h1 className="text-2xl sm:text-3xl font-semibold tracking-tight">Polymex — Cockpit usine</h1>
             <div className="text-sm opacity-80">Période : {dLong(M.dates[0])} – {dLong(M.dates[M.dates.length - 1])} · {M.dates.length} jours · 7 lignes d'extrusion · 3 équipes</div>
           </div>
-          <nav className="flex gap-1">
+          <nav className="flex flex-wrap items-center gap-1">
+            {A.pending > 0 && (
+              <button onClick={() => setTab("problems")} className="mr-2 text-xs font-semibold px-2 py-1 rounded"
+                style={{ background: "#FDEBDD", color: "#9A4A06" }}>{A.pending} donnée{A.pending > 1 ? "s" : ""} à confirmer avec l'usine</button>
+            )}
             {TABS.map(([k, l]) => (
               <button key={k} onClick={() => setTab(k)} className="px-4 py-2 rounded-t text-base font-semibold"
                 style={tab === k ? { background: "#F4F5F7", color: C.navy } : { color: "#fff", opacity: 0.85 }}>{l}</button>
@@ -678,9 +1028,10 @@ function App() {
         </div>
       </header>
       <main className="max-w-[1400px] mx-auto px-4 sm:px-6 py-6">
-        {tab === "overview" && <Overview M={M} />}
-        {tab === "lines" && <Lines_ M={M} />}
-        {tab === "flow" && <Flow M={M} />}
+        {tab === "overview" && <Overview M={M} E={E} go={setTab} />}
+        {tab === "lines" && <Lines_ M={M} E={E} />}
+        {tab === "flow" && <Flow M={M} E={E} />}
+        {tab === "problems" && <Problems M={M} E={E} A={A} />}
       </main>
       <footer className="max-w-[1400px] mx-auto px-4 sm:px-6 pb-8 text-xs" style={{ color: C.muted }}>
         Indicateurs calculés dans le navigateur à partir de extrusion_shift_log.csv et stage_daily.csv. TRS = disponibilité × performance × qualité, agrégés par sommes.

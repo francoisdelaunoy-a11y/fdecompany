@@ -66,3 +66,29 @@ test("données réelles : TRS usine et M07 recoupent le calcul de référence", 
   assert.ok(Math.abs(K.oee(c.rows.filter((r) => r.machine === "M07")).oee - 0.5440) < 5e-4);
   assert.equal(K.flow(read("stage_daily.csv")).bottleneck, "extrusion");
 });
+
+const P = { margin: 300, downtimeCost: 250, smedPct: 0.3, worstDownPct: 0.5, bottleneckPct: 0.5, scrapTarget: 0.04 };
+
+test("impacts : minutes perdues valorisées au débit réel de tonnes bonnes", () => {
+  // 480 min planifiées, 240 de marche, 120 de pannes, 120 de changements, 6 t dont 0,6 t de rebut.
+  const r = row({ run_min: 240, unplanned_downtime_min: 120, changeovers: 2, changeover_min: 120, output_t: 6, scrap_t: 0.6 });
+  const stage = (st, s, b) => ({ date: "2026-01-05", stage: st, units: 7, planned_min: 1000, output_t: 90, starved_min: s, blocked_min: b });
+  const i = K.impacts([r], [stage("mixing", 0, 100), stage("extrusion", 0, 0), stage("packing", 200, 0)], P);
+  const get = (id) => i.problems.find((x) => x.id === id);
+  // Débit bon = 5,4 t / 4 h = 1,35 t/h ; 120 min ⇒ 2,7 t.
+  assert.ok(Math.abs(get("downtime").tonnes - 2.7) < 1e-9);
+  assert.ok(Math.abs(get("downtime").cost - (2.7 * 300 + 2 * 250)) < 1e-9);
+  assert.ok(Math.abs(get("changeover").gainEur - 2.7 * 0.3 * 300 * 365) < 1e-6);
+  // Rebut 10 % → cible 4 % : 6 × 6 % = 0,36 t récupérées sur 1 jour.
+  assert.ok(Math.abs(get("scrap").gainT - 0.36 * 365) < 1e-9);
+  // Goulot : mélange bloqué 100 min, débit 90 t / 900 min ⇒ 10 t.
+  assert.equal(get("bottleneck").stage, "extrusion");
+  assert.ok(Math.abs(get("bottleneck").tonnes - 10) < 1e-9);
+  assert.equal(i.problems[0].id, "bottleneck");
+});
+
+test("impacts : aucune division par zéro sur des données vides ou sans marche", () => {
+  const i = K.impacts([row({ planned_min: 0, run_min: 0, output_t: 0 })], [], { ...P, scrapTarget: 0.5 });
+  i.problems.forEach((x) => { assert.ok(Number.isFinite(x.tonnes)); assert.ok(Number.isFinite(x.gainEur)); });
+  assert.equal(i.problems.find((x) => x.id === "scrap").gainT, 0);
+});
