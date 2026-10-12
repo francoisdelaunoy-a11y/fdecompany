@@ -1,0 +1,7 @@
+{
+  "name": "polymex-cockpit",
+  "private": true,
+  "scripts": {
+    "test": "node --test"
+  }
+}

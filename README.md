@@ -1,5 +1,7 @@
 # Polymex Plant Pulse
 
+> This project is now built with [Claude Code](https://claude.com/claude-code).
+
 FDE School, Day 1 morning lab. Build time 45 minutes, demo 3 minutes.
 
 ## The situation
