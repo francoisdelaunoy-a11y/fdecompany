@@ -16,4 +16,5 @@ description: Construire la baseline chiffrée d'un engagement — module KPI uni
 4. Tests unitaires (≥ 3) : cas parfait, cas limite (dénominateur nul), cas qui piège la moyenne de ratios, cas d'anomalie traitée.
 5. Unités sur chaque nombre affiché (t, %, min, €, j). Aucun chiffre en dur dans l'interface.
 6. Vérification indépendante : recalculer les 3 chiffres clés par une autre méthode (script séparé ou tableur, sans réutiliser le module) et remplir `VERIFY.md` (valeur, méthode, filtres, écart et explication).
-7. Lancer les tests et le build avant d'annoncer le résultat.
+7. Baseline écrite et signée avec le contrôleur du client (semaine 1) : métrique, formule, source, normalisation volume / mix / prix, cadence de revue, seuil de validation ; 12 mois glissants s'il y a de la saisonnalité, jamais moins de 6, périmètre figé.
+8. Lancer les tests et le build avant d'annoncer le résultat.

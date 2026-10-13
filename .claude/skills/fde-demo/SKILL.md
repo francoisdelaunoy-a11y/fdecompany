@@ -13,5 +13,6 @@ description: Préparer une démo client de 3 minutes sans slides et le passage d
    4. **L'insight** que le sponsor ne connaît pas : une phrase, un nombre, une source.
    5. **La question** à poser au sponsor lundi.
 3. Anticiper 3 objections probables (d'après les interviews) et la donnée qui y répond.
-4. Plan de passage de relais : qui fait vivre l'outil, quelles données le rafraîchissent, ce qui casse si personne ne s'en occupe.
-5. Ajouter une ligne datée à `log.md`.
+4. Avant mise en production : **mémo d'échec du déploiement naïf** (ce qui casse, qui réagit, sous quel délai).
+5. Passage de relais seulement quand existent monitoring, runbook et propriétaire interne formé, et que la nouvelle routine tient sans nous. Prévoir le champion interne, les changements d'équipe et la formation au poste ; mesurer l'adoption en décisions prises avec l'outil et motifs d'override, pas en connexions.
+6. Ajouter une ligne datée à `log.md`.

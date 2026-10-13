@@ -5,7 +5,9 @@ description: Profiler un jeu de données client avant tout calcul et écrire DAT
 
 # Profil des données
 
-Écrire un script reproductible (dans l'engagement, pas dans le scratch) qui produit pour chaque fichier :
+Commencer par un **recensement** : quelles données sont dans les systèmes (ERP, MES…), dans des tableurs, dans les têtes (souvent ~40 %). Pour chaque champ, le système propriétaire. Ne pas faire confiance aux données de référence ERP (gammes, cadences standard, délais) sans vérification terrain. Accès progressif : extraits en lecture, puis API, puis réécriture validée et tracée.
+
+Écrire un script reproductible et idempotent (clés métier stables, contrôles à chaque étape) (dans l'engagement, pas dans le scratch) qui produit pour chaque fichier :
 
 1. Nombre de lignes, colonnes, types ; période couverte.
 2. Lignes par période et par entité (jour × équipe, jour × machine, semaine × magasin…) ; **combinaisons manquantes** du calendrier attendu.

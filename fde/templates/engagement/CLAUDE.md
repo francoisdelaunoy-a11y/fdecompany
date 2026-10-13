@@ -6,7 +6,10 @@ Le playbook commun `fde/PLAYBOOK.md` s'applique. Ce fichier ne contient que ce q
 
 - Client : {{CLIENT}} ({{SECTEUR}})
 - Sponsor : {{SPONSOR}}, {{ROLE_SPONSOR}}
-- Question métier : {{QUESTION}}
+- Décision qui fait bouger la marge : {{DECISION}} — valeur estimée : {{VALEUR_EUR}} € / an (méthode : {{METHODE}})
+- Propriétaire côté client (mandat de décision) : {{PROPRIETAIRE}}
+- Contrôleur de gestion (baseline) : {{CONTROLEUR}}
+- Date d'arrêt si le gain n'est pas démontré : {{DATE_ARRET}}
 - Périmètre : {{PERIMETRE}}
 - Démo / jalon : {{DATE_DEMO}}
 - Langue des livrables : {{LANGUE}}

@@ -4,10 +4,12 @@ This repository is a Forward Deployed Engineering (FDE) practice used for AI tra
 
 ## FDE method (applies to every engagement)
 
-@fde/FDEbasics.md
+@.claude/skills/fde-basics/SKILL.md
 @fde/PLAYBOOK.md
 
-Skills for each step: `/fde-new-engagement`, `/fde-discovery`, `/fde-data-profile`, `/fde-kpi`, `/fde-impact`, `/fde-use-cases`, `/fde-demo`. New clients go in `engagements/<client>/`, created from `fde/templates/engagement/`, each with its own `CLAUDE.md`. Never mix data from one client into another client's work.
+The FDE basics above are the reference doctrine: they take precedence over the playbook and the step skills if they disagree.
+
+Skills: `/fde-basics` (doctrine), then one per step: `/fde-new-engagement`, `/fde-discovery`, `/fde-data-profile`, `/fde-kpi`, `/fde-impact`, `/fde-use-cases`, `/fde-demo`. New clients go in `engagements/<client>/`, created from `fde/templates/engagement/`, each with its own `CLAUDE.md`. Never mix data from one client into another client's work.
 
 ## Engagement: Polymex Industries (files at the repository root)
 

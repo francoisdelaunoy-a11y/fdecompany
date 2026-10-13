@@ -5,9 +5,10 @@ description: Ouvre un nouvel engagement FDE pour un client (marque, industriel, 
 
 # Ouvrir un engagement
 
-1. Relire `fde/FDEbasics.md` et `fde/PLAYBOOK.md`.
+1. Appliquer `/fde-basics` (doctrine) et `fde/PLAYBOOK.md`.
 2. Recueillir, en **une seule question groupée** (AskUserQuestion ou liste), ce qui manque parmi :
-   client et secteur, sponsor et son rôle, question métier en une phrase (avec son coût supposé), périmètre (sites, lignes, marques, période), date de démo, langue des livrables, contraintes de confidentialité, sources de données disponibles.
+   client et secteur, sponsor et son rôle, **la décision qui fait bouger la marge** (planifier, acheter, lancer, chiffrer) et son ordre de grandeur en €, propriétaire côté client avec mandat de décision, date d'arrêt, périmètre figé et nommé (site phare, lignes, marques, période), contrôleur de gestion pour la baseline, date de démo, langue des livrables, contraintes de confidentialité, sources de données disponibles.
+   Si la décision ne peut pas être chiffrée en €, le dire : c'est un motif de refus ou de recadrage.
    Ne rien inventer : laisser `{{...}}` pour ce qui reste inconnu et le lister comme question ouverte.
 3. Créer `engagements/<client-en-kebab-case>/` en copiant `fde/templates/engagement/` puis remplir les `{{...}}` connus.
 4. Ajouter à `log.md` de l'engagement : `- AAAA-MM-JJ : engagement ouvert, sponsor X, question « … ».`
